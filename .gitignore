@@ -1,0 +1,21 @@
+# Simulation outputs
+*.vcd
+*.vvp
+*.vpd
+
+# Build directories
+build/
+out/
+obj/
+
+# Vivado
+*.rpt
+*.jou
+*.log
+*.str
+*.xpe
+*.xpr
+*.cache/
+.hw/
+.ip_user_files/
+.xil/
