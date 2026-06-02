@@ -93,7 +93,7 @@ module tb_PE;
     endtask
 
     initial begin
-        $dumpfile("sim/tb_PE.vcd");
+        $dumpfile("build/tb_PE.vcd");
         $dumpvars(0, tb_PE);
 
         clk = 0;
