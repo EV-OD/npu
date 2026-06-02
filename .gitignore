@@ -3,10 +3,6 @@
 *.vvp
 *.vpd
 
-*/*.vcd
-*/*.vvp
-*/*.vpd
-
 # Build directories
 build/
 out/
