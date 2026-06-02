@@ -1,0 +1,13 @@
+{
+  "project_name": "NPU",
+  "toplevel": "processing_element",
+  "compiler": "iverilog",
+  "standards": {
+    "verilog": "v2005"
+  },
+  "paths": {
+    "source_dirs": ["src/**/*.v"],
+    "testbench_dirs": ["sim/**/*.v"],
+    "output_dir": "build"
+  }
+}

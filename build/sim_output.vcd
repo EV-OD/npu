@@ -1,0 +1,63 @@
+$date
+	Tue Jun  2 19:22:33 2026
+$end
+$version
+	Icarus Verilog
+$end
+$timescale
+	1ps
+$end
+$scope module npu_tb $end
+$var wire 16 ! accumulator [15:0] $end
+$var reg 8 " activation [7:0] $end
+$var reg 1 # clk $end
+$var reg 1 $ rst $end
+$var reg 8 % weight [7:0] $end
+$scope module uut $end
+$var wire 8 & activation [7:0] $end
+$var wire 1 # clk $end
+$var wire 1 $ rst $end
+$var wire 8 ' weight [7:0] $end
+$var reg 16 ( accumulator [15:0] $end
+$upscope $end
+$upscope $end
+$enddefinitions $end
+$comment Show the parameter values. $end
+$dumpall
+$end
+#0
+$dumpvars
+b0 (
+b0 '
+b0 &
+b0 %
+1$
+0#
+b0 "
+b0 !
+$end
+#10000
+1#
+#20000
+0#
+b11 "
+b11 &
+b10 %
+b10 '
+0$
+#30000
+b110 !
+b110 (
+1#
+#40000
+0#
+b101 "
+b101 &
+b100 %
+b100 '
+#50000
+b11010 !
+b11010 (
+1#
+#60000
+0#
