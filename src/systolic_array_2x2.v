@@ -4,8 +4,8 @@ module systolic_array_2x2 (
     input  wire         rst,
     
     // External Matrix Activations (X) streaming into the COLUMNS from the top
-    input  wire signed [15:0] col1_act_x, // Streams [x11, x12] down Column 1
-    input  wire signed [15:0] col2_act_x, // Streams [x21, x22] down Column 2
+    input  wire signed [15:0] col1_act_x, // Streams [x11, x21] down Column 1
+    input  wire signed [15:0] col2_act_x, // Streams [x12, x22] down Column 2
     
     // Stationary Weights (Y) loaded into the PEs spatially
     input  wire signed [15:0] pe11_weight_y, // Static weight y11

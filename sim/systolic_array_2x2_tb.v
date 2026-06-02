@@ -46,10 +46,10 @@ module systolic_array_2x2_tb;
         col1_act_x = 0;
         col2_act_x = 0;
         
-        // Matrix X (Activations): [ 2  3 ]     Matrix Y (Weights): [ 5  7 ]
-        //                        [ 4  1 ]                         [ 6  8 ]
-        // Expected Matrix C = X * Y:
-        // c11 = 28, c12 = 38, c21 = 26, c22 = 36
+        // Matrix X (Activations): [ 2  3 ]  -> x11=2, x12=3, x21=4, x22=1
+        //                         [ 4  1 ]     
+        // Matrix Y (Weights):     [ 5  7 ]  -> y11=5, y12=7, y21=6, y22=8
+        //                         [ 6  8 ]
 
         // Load stationary weight coordinates
         pe11_weight_y = 16'd5;  // y11
@@ -74,8 +74,8 @@ module systolic_array_2x2_tb;
 
         // --- Cycle 2 ---
         // Column 1 gets x12. Column 2 steps up and gets x21.
-        col1_act_x = 16'd3; // x12
-        col2_act_x = 16'd4; // x21
+        col1_act_x = 16'd4; // x12
+        col2_act_x = 16'd3; // x21
         @(posedge clk);
 
         // --- Cycle 3 ---
