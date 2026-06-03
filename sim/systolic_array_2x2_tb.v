@@ -30,34 +30,40 @@ module systolic_array_2x2_tb;
 
     integer cycle_cnt;
 
-    task show;
-        begin
-            $strobe("--- Cycle %0d @ %0t ---", cycle_cnt, $time);
-            $strobe("  Drive: row1_x=%0d  row2_x=%0d  col1_y=%0d  col2_y=%0d",
-                     row1_x, row2_x, col1_y, col2_y);
-            $strobe("  PE11: in_x=%0d  in_y=%0d  c11 = accum(%0d) + psum(%0d) = %0d  | out_x=%0d  out_y=%0d",
-                     row1_x, col1_y, uut.pe11.accumulator, 0, c11,
-                     uut.pe11.out_x, uut.pe11.out_y);
-            $strobe("  PE12: in_x=%0d  in_y=%0d  c12 = accum(%0d) + psum(%0d) = %0d  | out_x=%0d  out_y=%0d",
-                     uut.x_to_pe12, col2_y, uut.pe12.accumulator, 0, c12,
-                     uut.pe12.out_x, uut.pe12.out_y);
-            $strobe("  PE21: in_x=%0d  in_y=%0d  c21 = accum(%0d) + psum(%0d) = %0d  | out_x=%0d  out_y=%0d",
-                     row2_x, uut.y_to_pe21, uut.pe21.accumulator, 0, c21,
-                     uut.pe21.out_x, uut.pe21.out_y);
-            $strobe("  PE22: in_x=%0d  in_y=%0d  c22 = accum(%0d) + psum(%0d) = %0d  | out_x=%0d  out_y=%0d",
-                     uut.x_to_pe22, uut.y_to_pe22, uut.pe22.accumulator, 0, c22,
-                     uut.pe22.out_x, uut.pe22.out_y);
-        end
-    endtask
-
     task drive;
         input signed [15:0] r1, r2, c1, c2;
+        integer c;
+        reg [8*16:1] e11, e12, e21, e22;
         begin
             @(negedge clk);
             row1_x <= r1; row2_x <= r2;
             col1_y <= c1; col2_y <= c2;
-            show();
+            c = cycle_cnt;
             cycle_cnt = cycle_cnt + 1;
+
+            e11 = ""; e12 = ""; e21 = ""; e22 = "";
+            case (c)
+                0: e11 = "x11*y11";
+                2: begin e11 = "x12*y21"; e12 = "x11*y12"; e21 = "x21*y11"; end
+                4: begin e12 = "x12*y22"; e21 = "x22*y21"; e22 = "x21*y12"; end
+                6: e22 = "x22*y22";
+            endcase
+
+            $strobe("--- Cycle %0d @ %0t ---", c, $time);
+            $strobe("  Drive: row1_x=%0d  row2_x=%0d  col1_y=%0d  col2_y=%0d",
+                     row1_x, row2_x, col1_y, col2_y);
+            $strobe("  PE11: c11 += %s = %0d*%0d → accum=%0d  c11=%0d  out_x=%0d  out_y=%0d",
+                     e11, row1_x, col1_y, uut.pe11.accumulator, c11,
+                     uut.pe11.out_x, uut.pe11.out_y);
+            $strobe("  PE12: c12 += %s = %0d*%0d → accum=%0d  c12=%0d  out_x=%0d  out_y=%0d",
+                     e12, uut.x_to_pe12, col2_y, uut.pe12.accumulator, c12,
+                     uut.pe12.out_x, uut.pe12.out_y);
+            $strobe("  PE21: c21 += %s = %0d*%0d → accum=%0d  c21=%0d  out_x=%0d  out_y=%0d",
+                     e21, row2_x, uut.y_to_pe21, uut.pe21.accumulator, c21,
+                     uut.pe21.out_x, uut.pe21.out_y);
+            $strobe("  PE22: c22 += %s = %0d*%0d → accum=%0d  c22=%0d  out_x=%0d  out_y=%0d",
+                     e22, uut.x_to_pe22, uut.y_to_pe22, uut.pe22.accumulator, c22,
+                     uut.pe22.out_x, uut.pe22.out_y);
         end
     endtask
 
