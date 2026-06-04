@@ -2,56 +2,61 @@
 
 ## Overview
 
-The readout unit captures the systolic array's N×N accumulator values in parallel when `trigger` pulses. Since the array outputs are **stationary** (PE registers hold results indefinitely once `acc_en` is deasserted), the parallel capture is the only readout mechanism needed.
+The readout unit receives one row of the C matrix per cycle from the `readout_shifter`. It collects all N rows into an internal buffer, then outputs the full N×N result matrix in parallel once all rows have arrived.
 
 ## Input → Output Transformation
 
 | Input | What it does | Output | What it represents |
 |-------|-------------|--------|--------------------|
-| `pe_c` | Sampled into `result` on `trigger` rising edge | `result` | Captured C matrix — all N×N accumulator values in parallel |
-| `trigger` | Rising edge initiates capture | `valid` | High (and held) while `result` holds valid data |
+| `shift_valid` | Each pulse indicates a valid row on `row_in` | `result` | Captured C matrix — all N×N accumulator values in parallel |
+| `row_in` | One row (N elements) captured each cycle | `valid` | High (and held) while `result` holds valid data |
 
-On `trigger` posedge:
+On each `shift_valid` posedge:
 ```
-result <= pe_c
+rows[row_idx] <= row_in
+row_idx <= row_idx + 1
+```
+
+When `row_idx == N-1` (last row):
+```
+result <= assemble(rows[0..N-2], row_in)
 valid  <= 1
+row_idx <= 0
 ```
-
-Both hold until the next `trigger` or `rst`.
 
 ## Ports
 
-| Port      | Direction | Width                       | Description                             |
-|-----------|-----------|-----------------------------|-----------------------------------------|
-| `clk`     | input     | 1                           | Clock                                   |
-| `rst`     | input     | 1                           | Synchronous reset                       |
-| `trigger` | input     | 1                           | Capture strobe (rising edge)            |
-| `pe_c`    | input     | `N × N × ACCUM_WIDTH`       | Flattened PE accumulator values         |
-| `valid`   | output    | 1                           | High while parallel result is valid     |
-| `result`  | output    | `N × N × ACCUM_WIDTH`       | Captured parallel result (C matrix)     |
+| Port | Direction | Width | Description |
+|------|-----------|-------|-------------|
+| `clk` | input | 1 | Clock |
+| `rst` | input | 1 | Synchronous reset |
+| `shift_valid` | input | 1 | Row strobe from shifter — active for N cycles |
+| `row_in` | input | `N × ACCUM_WIDTH` | One row of C from shifter |
+| `valid` | output | 1 | High while full parallel result is valid |
+| `result` | output | `N × N × ACCUM_WIDTH` | Captured parallel result (full C matrix) |
 
 ## Parameters
 
-| Parameter     | Default | Description                      |
-|---------------|---------|----------------------------------|
-| `N`           | 4       | Matrix dimension                 |
-| `ACCUM_WIDTH` | 40      | Bit width of each PE accumulator |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `N` | 4 | Matrix dimension |
+| `ACCUM_WIDTH` | 40 | Bit width of each PE accumulator |
 
 ## Timing
 
 ```
-clk     ─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─
-trigger ___───___________________
-valid   _______───────────────────
-result      XXXXXXXXXXXX[ C ]XXXXX
-                        └── captured at this edge
+clk          ─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─
+shift_valid  _______─────────_______
+                          ^ row input pulses
+row_in       XXXX[ row0 ][ row1 ][ row2 ]XXXX
+valid        ___________________________───
+result       XXXXXXXXXXXXXXXXXXXXXXXXXXX[ C ]XX
+                                       └── assembled at this edge
 ```
-
-The capture happens on the same posedge where `trigger` is high. Results are available on `result` and `valid` one delta cycle after the posedge.
 
 ## Output Stationarity
 
-Since the systolic array's PE registers hold their accumulated values indefinitely once `acc_en` is deasserted (stationary output), the readout unit's parallel capture is a convenience layer — the results are already stable on the array's `pe_c` bus. The `result` register simply provides a latched copy that is insulated from future array operations.
+Once assembled, `result` holds until the next readout operation. Since `pe_c` is captured by the shipper before the readout unit starts collecting rows, the array outputs can be released while the shift-out is in progress.
 
 ## Usage
 
@@ -61,8 +66,8 @@ readout_unit #(
     .ACCUM_WIDTH(40)
 ) rdout (
     .clk(clk), .rst(rst),
-    .trigger(readout_trig),
-    .pe_c(pe_c),
+    .shift_valid(shift_row_valid),
+    .row_in(shift_row),
     .valid(result_valid),
     .result(result)
 );

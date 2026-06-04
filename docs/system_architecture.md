@@ -18,35 +18,41 @@ All intermediate and output values are **stationary** — they hold their state 
 ## Block Diagram
 
 ```
-                  ┌──────────────────────────────────────────┐
-                  │              npu_core                    │
-                  │                                          │
-  start ─────────►│  ┌──────────────────────────────────┐    │
-                  │  │   execution_sequencer             │    │
-  seq_data_valid ◄──┤  - state machine                  │    │
-  seq_data_idx   ◄──┤  - data_valid/data_idx generation │    │
-                  │  │  - acc_clr, acc_en, readout_trig │    │
-                  │  │  - busy, done                    │    │
-                  │  └──┬───────────┬──────────┬────────┘    │
-                  │     │           │          │             │
-                  │  acc_clr    acc_en   readout_trig        │
-                  │     │           │          │             │
-raw_a_col ───────►│  ┌──▼───────┐ ┌─▼──────────▼──────┐      │
-                  │  │skew_a    │ │  systolic_array   │      │
-raw_b_row ───────►│  │skew_b    │ │  _nxn_ctrl       │      │
-                  │  └────┬─────┘ │  (N×N PE_ctrl)   │      │
-                  │       │       │                   │      │
-                  │       └──────►│ in_left/in_top    │      │
-                  │               │                   │      │
-                  │               └───────┬───────────┘      │
-                  │                       │                  │
-                  │               ┌───────▼───────────┐      │
-                  │               │   readout_unit    │      │
-  result_valid ◄──┤               │                   │      │
-  result      ◄──┤               └───────────────────┘      │
-                  │                                          │
-  done ◄──────────┤                                          │
-                  └──────────────────────────────────────────┘
+                  ┌──────────────────────────────────────────────────┐
+                  │              npu_core                            │
+                  │                                                  │
+  start ─────────►│  ┌──────────────────────────────────────┐       │
+                  │  │   execution_sequencer               │       │
+  seq_data_valid ◄──┤  - state machine                    │       │
+  seq_data_idx   ◄──┤  - data_valid/data_idx generation   │       │
+                  │  │  - acc_clr, acc_en, readout_trig    │       │
+                  │  │  - busy, done                      │       │
+                  │  └──┬───────────┬──────────┬──────────┘       │
+                  │     │           │          │                  │
+                  │  acc_clr    acc_en   readout_trig            │
+                  │     │           │          │                  │
+ raw_a_col ───────►│  ┌──▼───────┐ ┌─▼──────────▼──────┐          │
+                  │  │skew_a    │ │  systolic_array   │          │
+ raw_b_row ───────►│  │skew_b    │ │  _nxn_ctrl       │          │
+                  │  └────┬─────┘ │  (N×N PE_ctrl)   │          │
+                  │       │       │                   │          │
+                  │       └──────►│ in_left/in_top    │          │
+                  │               │                   │          │
+                  │               └───────┬───────────┘          │
+                  │                       │ pe_c (N² × ACCUM)   │
+                  │               ┌───────▼───────────┐          │
+                  │               │ readout_shifter   │          │
+                  │               │ (parallel load,   │          │
+                  │               │  row-by-row shift)│          │
+                  │               └───────┬───────────┘          │
+                  │               row_out │ (N × ACCUM)          │
+                  │               ┌───────▼───────────┐          │
+                  │               │   readout_unit    │          │
+  result_valid ◄──┤               │                   │          │
+  result      ◄──┤               └───────────────────┘          │
+                  │                                                  │
+  done ◄──────────┤                                                  │
+                  └──────────────────────────────────────────────────┘
 ```
 
 ## Data Flow
@@ -74,11 +80,17 @@ The `systolic_array_nxn_ctrl` instantitates an N×N grid of `PE_ctrl` tiles. Eac
 PE(i,j) accumulates: Σ_k A[i][k] × B[k][j]
 ```
 
-### 4. Drain and Readout
+### 4. Drain
 
-After all N feeds, the sequencer enters DRAIN, keeping `acc_en=1` while the last data propagates through the pipeline. When the pipeline is fully drained, `readout_trig` pulses and the `readout_unit` captures all PE accumulator values in parallel.
+After all N feeds, the sequencer enters DRAIN, keeping `acc_en=1` while the last data propagates through the pipeline.
 
-Since PE outputs are **stationary** (registers hold their values when `acc_en=0`), the captured result remains valid indefinitely.
+### 5. Readout Shift
+
+When the pipeline is fully drained, `readout_trig` pulses for 1 cycle, causing the `readout_shifter` to parallel-capture all N×N accumulator values from the array into N internal row registers. The sequencer then enters the SHIFT state, which lasts N cycles. During each SHIFT cycle, the shifter outputs one row (N elements) to the `readout_unit`.
+
+### 6. Result Assembly
+
+The `readout_unit` collects one row per cycle over N cycles. On the last row, it assembles the full N×N result matrix and asserts `valid`. The sequencer transitions to DONE_S, asserting `done`.
 
 ## Component Hierarchy
 
@@ -89,38 +101,40 @@ npu_core
 ├── skew_buffer  #skew_b       (B-row skew)
 ├── systolic_array_nxn_ctrl    (controlled array)
 │   └── PE_ctrl × N×N         (processing elements)
-└── readout_unit               (result capture)
+├── readout_shifter            (parallel load, row-by-row shift)
+└── readout_unit               (row collection + result assembly)
 ```
 
 ## Pipeline Stages
 
-| Stage              | Cycles                    | Description                              |
-|--------------------|---------------------------|------------------------------------------|
-| CLEAR              | 1                         | Reset all accumulators to 0              |
-| LOAD               | `2N`                      | Feed N column-row pairs (every 2 cycles) |
-| DRAIN              | `4N` (auto)               | Wait for pipeline to drain               |
-| RDOUT              | 1                         | Capture results                          |
-| DONE               | until `!start`            | Hold done flag                           |
+| Stage | Cycles | Description |
+|-------|--------|-------------|
+| CLEAR | 1 | Reset all accumulators to 0 |
+| LOAD | `2N` | Feed N column-row pairs (every 2 cycles) |
+| DRAIN | `4N` (auto) | Wait for pipeline to drain |
+| RDOUT | 1 | Load shifter with all PE accumulator values |
+| SHIFT | `N` | Stream rows from shifter → readout unit |
+| DONE | until `!start` | Hold done flag |
 
 ## Latency
 
 Total cycles from `start` to `done`:
 
 ```
-L_total = 1 + 2N + 4N + 1 + 1 = 6N + 3
+L_total = 1 + 2N + 4N + 1 + N + 1 = 7N + 3
 ```
 
-For N=4: 27 cycles. For N=8: 51 cycles.
+For N=4: 31 cycles. For N=8: 59 cycles.
 
 ## Parameters (all tied together)
 
 The `npu_core` module exposes the same parameters as its sub-modules:
 
-| Parameter      | Default | Sub-modules affected                     |
-|----------------|---------|------------------------------------------|
-| `N`            | 4       | All                                      |
-| `DATA_WIDTH`   | 16      | `PE_ctrl`, `skew_buffer`                 |
-| `ACCUM_WIDTH`  | 40      | `PE_ctrl`, `readout_unit`                |
+| Parameter | Default | Sub-modules affected |
+|-----------|---------|---------------------|
+| `N` | 4 | All |
+| `DATA_WIDTH` | 16 | `PE_ctrl`, `skew_buffer` |
+| `ACCUM_WIDTH` | 40 | `PE_ctrl`, `readout_shifter`, `readout_unit` |
 
 ## Interface Protocol
 
@@ -131,12 +145,13 @@ The `npu_core` module exposes the same parameters as its sub-modules:
 
 ## Verification
 
-The testbench (`tb_system.v`) runs two tests per N:
+The testbench (`tb_system.v`) runs three tests per N:
 
-1. **Fixed matrix** (hardcoded 3×3 values, extended to N×N for generic N)
-2. **Random matrix** (random values, all elements compared against reference computation)
+1. **Deterministic matrix** (values derived from indices, verified against reference computation)
+2. **Random matrix** (seed 42, random values, all elements compared)
+3. **Random matrix** (seed 99, independent random values)
 
-All N from 2 to 8 pass with the default `4×N` drain formula.
+All N from 2 to 8 pass with the default configuration.
 
 ## Output Stationarity
 
@@ -146,7 +161,6 @@ All results in this system are **stationary**:
 |--------|--------|-------------|-----|
 | `PE_ctrl` | `out_c` | Yes | Register holds value until next clock edge; frozen when `acc_en=0` |
 | `systolic_array_nxn_ctrl` | `out_c` | Yes | All PE `out_c` registers hold in parallel |
-| `readout_unit` | `result` | Yes | Captured at `trigger` posedge, held until next trigger |
+| `readout_shifter` | `row_out` | Yes | Internal row registers hold until overwritten by next `load` |
+| `readout_unit` | `result` | Yes | Assembled from shifter rows, held until next readout |
 | `execution_sequencer` | `done` | Yes | Held until `start` deasserted |
-
-This means the readout unit's parallel capture is purely a convenience — the results are already available on the array's `out_c` bus at any time after `acc_en` is deasserted.
