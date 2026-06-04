@@ -5,24 +5,30 @@ module tb_readout;
     parameter N = 3;
     parameter ACCUM_WIDTH = 40;
 
-    reg clk, rst, trigger, shift_mode;
+    reg clk, rst, trigger;
     reg [(N*N*ACCUM_WIDTH)-1:0] pe_c;
     wire valid;
     wire [(N*N*ACCUM_WIDTH)-1:0] result;
-    wire shift_valid;
-    wire [ACCUM_WIDTH-1:0] shift_out;
-    wire shift_done;
 
-    readout_unit #(.N(N), .ACCUM_WIDTH(ACCUM_WIDTH)) uut (
-        .clk(clk), .rst(rst), .trigger(trigger), .shift_mode(shift_mode),
-        .pe_c(pe_c), .valid(valid), .result(result),
-        .shift_valid(shift_valid), .shift_out(shift_out), .shift_done(shift_done)
+    wire [(N*ACCUM_WIDTH)-1:0] shift_row;
+    wire shift_valid;
+
+    readout_shifter #(.N(N), .ACCUM_WIDTH(ACCUM_WIDTH)) shift (
+        .clk(clk), .rst(rst), .load(trigger),
+        .pe_c(pe_c),
+        .row_out(shift_row), .row_valid(shift_valid), .shift_done()
+    );
+
+    readout_unit #(.N(N), .ACCUM_WIDTH(ACCUM_WIDTH)) rdout (
+        .clk(clk), .rst(rst),
+        .shift_valid(shift_valid), .row_in(shift_row),
+        .valid(valid), .result(result)
     );
 
     always #5 clk = ~clk;
 
-    integer i, j, errors;
-    reg [256:0] msg_str;
+    integer i, j, errors, pass_count, fail_count;
+    integer idx, r;
 
     task check;
         input [256:0] msg;
@@ -31,8 +37,9 @@ module tb_readout;
             if (!cond) begin
                 $display("  FAIL: %s @ %0t", msg, $time);
                 errors = errors + 1;
+                fail_count = fail_count + 1;
             end else begin
-                $display("  OK:   %s", msg);
+                pass_count = pass_count + 1;
             end
         end
     endtask
@@ -45,21 +52,30 @@ module tb_readout;
     endtask
 
     task load_pe_values;
-        input [15:0] base;
-        integer idx;
+        input [31:0] base;
         begin
             for (i = 0; i < N; i = i + 1)
                 for (j = 0; j < N; j = j + 1) begin
                     idx = i*N + j;
                     pe_c[(idx * ACCUM_WIDTH) +: ACCUM_WIDTH] = (idx + 1) * base;
                 end
+            $display("  PE values loaded (base=%0d):", base);
+            for (i = 0; i < N; i = i + 1) begin
+                $write("    ");
+                for (j = 0; j < N; j = j + 1) begin
+                    idx = i*N + j;
+                    $write("%0d ", (idx+1)*base);
+                end
+                $write("\n");
+            end
         end
     endtask
 
     task verify_values;
-        input [15:0] base;
-        integer idx;
+        input [31:0] base;
+        integer element_errors;
         begin
+            element_errors = 0;
             for (i = 0; i < N; i = i + 1)
                 for (j = 0; j < N; j = j + 1) begin
                     idx = i*N + j;
@@ -68,8 +84,16 @@ module tb_readout;
                                  i, j, (idx+1)*base,
                                  $signed(result[(idx*ACCUM_WIDTH)+:ACCUM_WIDTH]), $time);
                         errors = errors + 1;
+                        element_errors = element_errors + 1;
+                        fail_count = fail_count + 1;
+                    end else begin
+                        pass_count = pass_count + 1;
                     end
                 end
+            if (element_errors == 0)
+                $display("  All %0d values match (base=%0d)", N*N, base);
+            else
+                $display("  %0d / %0d values mismatch (base=%0d)", element_errors, N*N, base);
         end
     endtask
 
@@ -77,73 +101,80 @@ module tb_readout;
         $dumpfile("tb_readout.vcd");
         $dumpvars(0, tb_readout);
 
-        clk = 0; rst = 1; trigger = 0; shift_mode = 0; pe_c = 0;
-        errors = 0;
-        #15 rst = 0;
+        clk = 0; rst = 1; trigger = 0; pe_c = 0;
+        errors = 0; pass_count = 0; fail_count = 0;
+        #18 rst = 0;
         ps();
 
-        $display("=== READOUT UNIT TEST ===");
+        $display("=== READOUT CHAIN TEST (N=%0d, shifter+readout_unit) ===", N);
+        $display("");
 
-        // ---- Test 1: Parallel mode (shift_mode=0) ----
-        $display("--- Test 1: Parallel capture ---");
+        // -------------------------------------------------------
+        // Test 1: Reset state
+        // -------------------------------------------------------
+        $display("--- Test 1: Post-reset ---");
         check("reset: valid=0", valid == 0);
-        check("reset: result=0", result == 0);
+        check("reset: shift_valid=0", shift_valid == 0);
 
+        // -------------------------------------------------------
+        // Test 2: Trigger and capture all rows
+        // -------------------------------------------------------
+        $display("");
+        $display("--- Test 2: Trigger + shift out %0d rows ---", N);
         load_pe_values(100);
         @(negedge clk);
         trigger = 1;
         ps();
         trigger = 0;
 
-        check("triggered: valid=1", valid == 1);
+        // Wait for all N shift cycles + 1 for final assembly
+        $display("  Waiting for %0d shift cycles...", N);
+        repeat (N) @(posedge clk);
+        #1;
+
+        check("capture: valid=1", valid == 1);
         verify_values(100);
 
+        // -------------------------------------------------------
+        // Test 3: Hold after input changes
+        // -------------------------------------------------------
+        $display("");
+        $display("--- Test 3: Hold after pe_c changes ---");
         pe_c = 0;
         ps();
         check("hold: valid still 1", valid == 1);
         verify_values(100);
 
+        // -------------------------------------------------------
+        // Test 4: Re-trigger with new values
+        // -------------------------------------------------------
+        $display("");
+        $display("--- Test 4: Re-trigger ---");
         load_pe_values(200);
         @(negedge clk);
         trigger = 1;
         ps();
         trigger = 0;
+
+        repeat (N) @(posedge clk);
+        #1;
+
+        check("re-trigger: valid=1", valid == 1);
         verify_values(200);
 
-        // ---- Test 2: Serial shift-out mode (shift_mode=1) ----
-        $display("\n--- Test 2: Serial shift-out ---");
-        load_pe_values(300);
-        @(negedge clk);
-        shift_mode = 1;
-        trigger = 1;
-        ps();
-        trigger = 0;
-
-        check("shift: valid=1", valid == 1);
-        check("shift: shift_valid=1 on first word", shift_valid == 1);
-        check("shift: shift_out[0]=300", $signed(shift_out) == 300);
-
-        // Shift out remaining N*N-1 words
-        for (i = 1; i < N*N; i = i + 1) begin
-            ps();
-            msg_str = "shift_valid during shift";
-            check(msg_str, shift_valid == 1);
-            msg_str = "shift_out value during shift";
-            check(msg_str, $signed(shift_out) == (i+1)*300);
-        end
-
-        ps();
-        check("shift: cycle done, shift_valid=0", shift_valid == 0);
-        check("shift: shift_done=1", shift_done == 1);
-        check("shift: parallel result unchanged", valid == 1);
-        verify_values(300);
-
+        // -------------------------------------------------------
+        // Summary
+        // -------------------------------------------------------
         $display("");
-        if (errors == 0)
-            $display("*** READOUT UNIT TEST PASSED ***");
-        else
-            $display("*** READOUT UNIT TEST FAILED with %0d errors ***", errors);
-
+        $display("--- RESULTS ---");
+        $display("  Checks: %0d passed, %0d failed, %0d total", pass_count, fail_count, pass_count+fail_count);
+        if (errors == 0) begin
+            $display("");
+            $display("*** READOUT CHAIN TEST PASSED ***");
+        end else begin
+            $display("");
+            $display("*** READOUT CHAIN TEST FAILED with %0d errors ***", errors);
+        end
         $finish;
     end
 

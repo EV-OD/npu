@@ -8,6 +8,19 @@ Identical topology to `systolic_array_nxn` but instantiates `PE_ctrl` instead of
 2. **Enable accumulation** during the load and drain phases
 3. **Freeze accumulators** for readout
 
+## Input → Output Transformation
+
+| Input | What it does | Output | What it represents |
+|-------|-------------|--------|--------------------|
+| `in_left[i]` | Routes to `PE_ctrl(i,0).in_x` as column `i` of A | — | One column of A (flattened) |
+| `in_top[j]` | Routes to `PE_ctrl(0,j).in_y` as row `j` of B | — | One row of B (flattened) |
+| `acc_clr` | Distributed to all PEs; synchronously zeros all accumulators | — | Pre-operation clear |
+| `acc_en` | Distributed to all PEs; gates accumulation in lockstep | — | Enables/disables multiply-add |
+| — | Each `PE_ctrl(i,j)` conditionally accumulates `Σ_k A[i][k] × B[k][j]` | `out_c[(i×N+j)]` | `C[i][j]` — one element of the result matrix |
+
+After one CLEAR + N feeds + DRAIN sequence with the sequencer:
+`out_c[(i×N+j)]` = `C[i][j]` = `Σ_k A[i][k] × B[k][j]`.
+
 ## Ports
 
 | Port      | Direction | Width                        | Description                            |
@@ -37,6 +50,12 @@ A typical matrix multiply sequence:
 3. **DRAIN** (4N cycles): `acc_clr=0`, `acc_en=1` — no new data, PEs continue accumulating as last data propagates
 4. **RDOUT** (1 cycle): `acc_clr=0`, `acc_en=0` — accumulators frozen; readout unit captures results
 5. **DONE** (×): `acc_clr=0`, `acc_en=0` — operation complete, array idle
+
+## Output Stationarity
+
+When `acc_en=0` (RDOUT state), all PE accumulators freeze simultaneously. The full `out_c` bus holds the completed C matrix **indefinitely** in parallel. A subsequent `acc_clr` or new operation is required to change the values.
+
+This means no serial shift-out or sequential readout is needed — the results are already available on `out_c` as a stable, parallel bus.
 
 ## When to Use
 

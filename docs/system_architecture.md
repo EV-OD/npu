@@ -4,6 +4,17 @@
 
 The NPU core is a parameterizable systolic-array-based matrix multiplier designed for tiled matrix multiplication. It computes `C = A × B` where all matrices are N×N, with configurable data widths and accumulator widths.
 
+All intermediate and output values are **stationary** — they hold their state in registers until explicitly cleared or overwritten. The result matrix C is available in parallel on `result` once `done` is asserted.
+
+## Input → Output Transformation
+
+| External Input | Internal path | External Output | Final result |
+|----------------|---------------|-----------------|--------------|
+| `raw_a_col` (one column of A per feed, N elements, flattened) | → skew_a → systolic array in_left | `result` (N×N × ACCUM_WIDTH, flattened) | `C[i][j]` = Σ_k A[i][k] × B[k][j] |
+| `raw_b_row` (one row of B per feed, N elements, flattened) | → skew_b → systolic array in_top | `result_valid` | High while `result` holds valid C matrix |
+| `start` | → execution_sequencer → FSM control | `done` | Operation complete |
+| | | `seq_data_valid`, `seq_data_idx` | Feed handshake for external data source |
+
 ## Block Diagram
 
 ```
@@ -67,6 +78,8 @@ PE(i,j) accumulates: Σ_k A[i][k] × B[k][j]
 
 After all N feeds, the sequencer enters DRAIN, keeping `acc_en=1` while the last data propagates through the pipeline. When the pipeline is fully drained, `readout_trig` pulses and the `readout_unit` captures all PE accumulator values in parallel.
 
+Since PE outputs are **stationary** (registers hold their values when `acc_en=0`), the captured result remains valid indefinitely.
+
 ## Component Hierarchy
 
 ```
@@ -124,3 +137,16 @@ The testbench (`tb_system.v`) runs two tests per N:
 2. **Random matrix** (random values, all elements compared against reference computation)
 
 All N from 2 to 8 pass with the default `4×N` drain formula.
+
+## Output Stationarity
+
+All results in this system are **stationary**:
+
+| Module | Output | Stationary? | Why |
+|--------|--------|-------------|-----|
+| `PE_ctrl` | `out_c` | Yes | Register holds value until next clock edge; frozen when `acc_en=0` |
+| `systolic_array_nxn_ctrl` | `out_c` | Yes | All PE `out_c` registers hold in parallel |
+| `readout_unit` | `result` | Yes | Captured at `trigger` posedge, held until next trigger |
+| `execution_sequencer` | `done` | Yes | Held until `start` deasserted |
+
+This means the readout unit's parallel capture is purely a convenience — the results are already available on the array's `out_c` bus at any time after `acc_en` is deasserted.

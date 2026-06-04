@@ -19,7 +19,8 @@ module tb_sequencer;
 
     always #5 clk = ~clk;
 
-    integer errors, fc;
+    integer errors, fc, i;
+    integer pass_count, fail_count;
 
     task check;
         input [256:0] msg;
@@ -28,6 +29,9 @@ module tb_sequencer;
             if (!cond) begin
                 $display("  FAIL: %s @ %0t", msg, $time);
                 errors = errors + 1;
+                fail_count = fail_count + 1;
+            end else begin
+                pass_count = pass_count + 1;
             end
         end
     endtask
@@ -44,74 +48,139 @@ module tb_sequencer;
         $dumpvars(0, tb_sequencer);
 
         clk = 0; rst = 1; start = 0;
-        errors = 0;
+        errors = 0; pass_count = 0; fail_count = 0;
         #15 rst = 0;
         ps();
         $display("=== SEQUENCER TEST (N=%0d) ===", N);
+        $display("");
 
-        // ---- IDLE ----
+        // -------------------------------------------------------
+        // Test IDLE state
+        // -------------------------------------------------------
+        $display("--- Phase 1: IDLE state ---");
         check("IDLE: acc_en=0",       acc_en     == 0);
         check("IDLE: busy=0",         busy       == 0);
         check("IDLE: done=0",         done       == 0);
         check("IDLE: data_valid=0",   data_valid == 0);
         check("IDLE: readout_trig=0", readout_trig == 0);
 
-        // ---- Start: IDLE->CLEAR->LOAD ----
+        // -------------------------------------------------------
+        // Start sequence: IDLE -> CLEAR -> LOAD
+        // -------------------------------------------------------
+        $display("");
+        $display("--- Phase 2: Start -> CLEAR -> LOAD ---");
         @(negedge clk); start = 1;
-        ps();  // state CLEAR (outputs IDLE)
-        ps();  // state LOAD  (outputs CLEAR)
+        ps();  // CLEAR (outputs still reflect IDLE)
+        ps();  // LOAD  (outputs reflect CLEAR state)
         check("CLEAR: acc_clr=1", acc_clr == 1);
         check("CLEAR: busy=1",    busy    == 1);
         check("CLEAR: acc_en=0",  acc_en  == 0);
+        check("CLEAR: data_valid=0", data_valid == 0);
+        check("CLEAR: readout_trig=0", readout_trig == 0);
 
-        // ---- LOAD with outputs active ----
+        // -------------------------------------------------------
+        // Test LOAD phase: data_valid pattern
+        // -------------------------------------------------------
+        $display("");
+        $display("--- Phase 3: LOAD (2N = %0d cycles) ---", 2*N);
         ps();  // state LOAD (outputs LOAD)
         fc = 0;
         repeat (2*N) begin
             if (data_valid) begin
-                $display("  LOAD dv=1 idx=%0d", data_idx);
-                check("idx in range", data_idx < N);
+                $display("  [FEED] dv=1 idx=%0d (feed %0d of %0d)", data_idx, data_idx+1, N);
+                check("idx in range [0, N-1]", data_idx < N);
                 fc = fc + 1;
+            end else begin
+                $display("  [IDLE] dv=0 (gap cycle)");
             end
             check("LOAD: busy=1", busy == 1);
             check("LOAD: done=0", done == 0);
+            check("LOAD: acc_en=1", acc_en == 1);
             ps();
         end
-        check("columns fed", fc == N);
+        check("FEED count = N", fc == N);
 
-        // ---- DRAIN ----
-        ps();  // state DRAIN (outputs LOAD)
+        // -------------------------------------------------------
+        // Test DRAIN phase
+        // -------------------------------------------------------
+        $display("");
+        $display("--- Phase 4: DRAIN (4N = %0d cycles) ---", 4*N);
+        ps();  // state DRAIN (outputs still LOAD)
         repeat (4*N) begin
             ps();
             check("DRAIN: acc_en=1",      acc_en     == 1);
             check("DRAIN: data_valid=0",  data_valid == 0);
             check("DRAIN: readout_trig=0",readout_trig == 0);
+            check("DRAIN: busy=1",        busy       == 1);
+            check("DRAIN: done=0",        done       == 0);
         end
+        $display("  DRAIN complete");
 
-        // ---- RDOUT ----
-        ps();
+        // -------------------------------------------------------
+        // Test RDOUT phase (1 cycle, triggers shifter load)
+        // -------------------------------------------------------
+        $display("");
+        $display("--- Phase 5: RDOUT ---");
+        ps();  // enter RDOUT
         check("RDOUT: readout_trig=1", readout_trig == 1);
         check("RDOUT: acc_en=0",       acc_en == 0);
+        check("RDOUT: data_valid=0",   data_valid == 0);
+        check("RDOUT: busy=1",         busy == 1);
+        check("RDOUT: done=0",         done == 0);
 
-        // ---- DONE ----
-        ps();
+        // -------------------------------------------------------
+        // Test SHIFT phase (N cycles, one row per cycle)
+        // -------------------------------------------------------
+        $display("");
+        $display("--- Phase 6: SHIFT (%0d cycles) ---", N);
+        for (i = 0; i < N; i = i + 1) begin
+            ps();
+            $display("  SHIFT cycle %0d", i+1);
+            check("SHIFT: busy=1", busy == 1);
+            check("SHIFT: readout_trig=0", readout_trig == 0);
+            check("SHIFT: done=0", done == 0);
+            check("SHIFT: acc_en=0", acc_en == 0);
+            check("SHIFT: data_valid=0", data_valid == 0);
+        end
+
+        // -------------------------------------------------------
+        // Test DONE state
+        // -------------------------------------------------------
+        $display("");
+        $display("--- Phase 7: DONE_S ---");
+        ps();  // DONE_S
         check("DONE: done=1", done == 1);
         check("DONE: busy=0", busy == 0);
         check("DONE: acc_en=0", acc_en == 0);
+        check("DONE: data_valid=0", data_valid == 0);
+        check("DONE: readout_trig=0", readout_trig == 0);
 
-        // ---- Back to IDLE ----
+        // -------------------------------------------------------
+        // Return to IDLE
+        // -------------------------------------------------------
+        $display("");
+        $display("--- Phase 8: Return to IDLE ---");
         @(negedge clk); start = 0;
-        ps();  // state IDLE (outputs DONE)
-        ps();  // state IDLE (outputs IDLE)
+        ps();  // state IDLE (outputs from DONE_S)
+        ps();  // state IDLE
         check("IDLE again: busy=0", busy == 0);
         check("IDLE again: done=0", done == 0);
+        check("IDLE again: acc_en=0", acc_en == 0);
+        check("IDLE again: data_valid=0", data_valid == 0);
 
+        // -------------------------------------------------------
+        // Summary
+        // -------------------------------------------------------
         $display("");
-        if (errors == 0)
+        $display("--- RESULTS ---");
+        $display("  Checks: %0d passed, %0d failed, %0d total", pass_count, fail_count, pass_count+fail_count);
+        if (errors == 0) begin
+            $display("");
             $display("*** SEQUENCER TEST PASSED ***");
-        else
+        end else begin
+            $display("");
             $display("*** SEQUENCER TEST FAILED with %0d errors ***", errors);
-
+        end
         $finish;
     end
 

@@ -9,20 +9,33 @@ The execution sequencer is the central FSM that orchestrates a complete matrix m
 - **Readout trigger**: a one-cycle `readout_trig` pulse
 - **Status**: `busy` and `done` flags
 
+## Input → Output Transformation
+
+| Input | What it does | Output | What it represents |
+|-------|-------------|--------|--------------------|
+| `start` | Rising edge initiates the FSM sequence from IDLE | — | Start a new matrix multiply |
+| — | FSM counts load cycles; `data_valid` pulses every 2 cycles during LOAD | `data_valid` | Strobe for the external source to drive the next A-column / B-row |
+| — | FSM tracks the current feed index via `load_cycle / 2` | `data_idx` | Index k of the current feed (0 to N-1) |
+| — | Asserted for 1 cycle in CLEAR state | `acc_clr` | Clear all PE accumulators |
+| — | Asserted in LOAD and DRAIN states; deasserted elsewhere | `acc_en` | Enable PE accumulation gates |
+| — | Asserted for 1 cycle in RDOUT state | `readout_trig` | Capture PE results into readout unit |
+| — | Asserted from CLEAR through RDOUT | `busy` | Operation in progress |
+| — | Asserted in DONE_S state | `done` | Operation complete, results ready |
+
 ## Ports
 
-| Port            | Direction | Width    | Description                                      |
-|-----------------|-----------|----------|--------------------------------------------------|
-| `clk`           | input     | 1        | Clock                                            |
-| `rst`           | input     | 1        | Synchronous reset (returns to IDLE)              |
-| `start`         | input     | 1        | Start a new matrix multiply (level-sensitive)     |
-| `data_valid`    | output    | 1        | Pulse high (1 cycle) indicating a data feed cycle|
-| `data_idx`      | output    | [31:0]   | Index of the feed (0 to N-1)                     |
-| `acc_clr`       | output    | 1        | Clear all PE accumulators (1 cycle pulse)        |
-| `acc_en`        | output    | 1        | Enable PE accumulation                           |
-| `readout_trig`  | output    | 1        | Pulse high to capture PE results                 |
-| `busy`          | output    | 1        | High while operation in progress                 |
-| `done`          | output    | 1        | High when operation complete                     |
+| Port           | Direction | Width    | Description                                      |
+|----------------|-----------|----------|--------------------------------------------------|
+| `clk`          | input     | 1        | Clock                                            |
+| `rst`          | input     | 1        | Synchronous reset (returns to IDLE)              |
+| `start`        | input     | 1        | Start a new matrix multiply (level-sensitive)     |
+| `data_valid`   | output    | 1        | Pulse high (1 cycle) indicating a data feed cycle|
+| `data_idx`     | output    | [31:0]   | Index of the feed (0 to N-1)                     |
+| `acc_clr`      | output    | 1        | Clear all PE accumulators (1 cycle pulse)        |
+| `acc_en`       | output    | 1        | Enable PE accumulation                           |
+| `readout_trig` | output    | 1        | Pulse high to capture PE results                 |
+| `busy`         | output    | 1        | High while operation in progress                 |
+| `done`         | output    | 1        | High when operation complete                     |
 
 ## Parameters
 

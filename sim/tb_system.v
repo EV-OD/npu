@@ -1,8 +1,5 @@
 `timescale 1ns / 1ps
 
-// =============================================================
-// Full NPU Core
-// =============================================================
 module npu_core #(
     parameter N = 4,
     parameter DATA_WIDTH = 16,
@@ -23,6 +20,8 @@ module npu_core #(
     wire acc_clr, acc_en, readout_trig, busy;
     wire [(N * DATA_WIDTH)-1:0] skewed_a, skewed_b;
     wire [(N * N * ACCUM_WIDTH)-1:0] pe_c;
+    wire [(N * ACCUM_WIDTH)-1:0] shift_row;
+    wire shift_row_valid;
 
     execution_sequencer #(.N(N)) seq (
         .clk(clk), .rst(rst), .start(start),
@@ -46,10 +45,19 @@ module npu_core #(
         .out_c(pe_c)
     );
 
+    readout_shifter #(.N(N), .ACCUM_WIDTH(ACCUM_WIDTH)) rdout_shift (
+        .clk(clk), .rst(rst),
+        .load(readout_trig),
+        .pe_c(pe_c),
+        .row_out(shift_row),
+        .row_valid(shift_row_valid),
+        .shift_done()
+    );
+
     readout_unit #(.N(N), .ACCUM_WIDTH(ACCUM_WIDTH)) rdout (
         .clk(clk), .rst(rst),
-        .trigger(readout_trig),
-        .pe_c(pe_c),
+        .shift_valid(shift_row_valid),
+        .row_in(shift_row),
         .valid(result_valid),
         .result(result)
     );
@@ -57,9 +65,6 @@ module npu_core #(
 endmodule
 
 
-// =============================================================
-// System Testbench
-// =============================================================
 module tb_system;
 
     parameter N = 3;
@@ -87,12 +92,9 @@ module tb_system;
     reg signed [ACCUM_WIDTH-1:0] C_exp [0:N-1][0:N-1];
     reg signed [ACCUM_WIDTH-1:0] actual;
 
-    integer i, j, k, errors;
+    integer i, j, k, errors, total_errors;
     integer di;
-    reg trigger_driven;
 
-    // Drive data based on seq_data_valid from the npu_core's sequencer
-    // Registered version to align with skew buffer timing
     reg data_feed_active;
     reg [31:0] feed_idx;
 
@@ -116,10 +118,17 @@ module tb_system;
                     raw_a_col[(di * DATA_WIDTH) +: DATA_WIDTH] <= A[di][feed_idx];
                     raw_b_row[(di * DATA_WIDTH) +: DATA_WIDTH] <= B[feed_idx][di];
                 end
-                $display("  FEED[%0d] @ %0t: A_col=[%0d %0d %0d] B_row=[%0d %0d %0d]",
-                         feed_idx, $time,
-                         A[0][feed_idx], A[1][feed_idx], A[2][feed_idx],
-                         B[feed_idx][0], B[feed_idx][1], B[feed_idx][2]);
+                $write("  FEED[%0d] @ %0t: A_col=[", feed_idx, $time);
+                for (di = 0; di < N; di = di + 1) begin
+                    $write("%0d", A[di][feed_idx]);
+                    if (di < N-1) $write(" ");
+                end
+                $write("] B_row=[");
+                for (di = 0; di < N; di = di + 1) begin
+                    $write("%0d", B[feed_idx][di]);
+                    if (di < N-1) $write(" ");
+                end
+                $write("]\n");
             end
         end else begin
             raw_a_col <= 0;
@@ -127,155 +136,207 @@ module tb_system;
         end
     end
 
+    task print_matrix;
+        input [256:0] label;
+        reg signed [DATA_WIDTH-1:0] m [0:N-1][0:N-1];
+        integer r, c;
+        begin
+            $display("%s:", label);
+            for (r = 0; r < N; r = r + 1) begin
+                $write("  ");
+                for (c = 0; c < N; c = c + 1) $write("%4d ", m[r][c]);
+                $write("\n");
+            end
+        end
+    endtask
+
+    task run_test_det;
+        input [1024:0] test_name;
+        integer r, c, kk;
+        reg signed [DATA_WIDTH-1:0] a_val, b_val;
+        begin
+            $display("\n==================================================");
+            $display(" %s (N=%0d)", test_name, N);
+            $display("==================================================");
+
+            for (r = 0; r < N; r = r + 1) begin
+                for (c = 0; c < N; c = c + 1) begin
+                    a_val = (r * N + c + 1) * 2 - 5;
+                    b_val = (c * N + r + 1) * 2 - 5;
+                    A[r][c] = a_val;
+                    B[r][c] = b_val;
+                    C_exp[r][c] = 0;
+                end
+            end
+
+            for (r = 0; r < N; r = r + 1)
+                for (c = 0; c < N; c = c + 1)
+                    for (kk = 0; kk < N; kk = kk + 1)
+                        C_exp[r][c] = C_exp[r][c] + A[r][kk] * B[kk][c];
+
+            $display("Matrix A:");
+            for (r = 0; r < N; r = r + 1) begin
+                $write("  ");
+                for (c = 0; c < N; c = c + 1) $write("%4d ", A[r][c]);
+                $write("\n");
+            end
+            $display("Matrix B:");
+            for (r = 0; r < N; r = r + 1) begin
+                $write("  ");
+                for (c = 0; c < N; c = c + 1) $write("%4d ", B[r][c]);
+                $write("\n");
+            end
+            $display("Expected C = A*B:");
+            for (r = 0; r < N; r = r + 1) begin
+                $write("  ");
+                for (c = 0; c < N; c = c + 1) $write("%4d ", C_exp[r][c]);
+                $write("\n");
+            end
+
+            @(posedge clk);
+            start = 1;
+            wait(done);
+            @(negedge clk);
+
+            errors = 0;
+            $display("\nResult C (from hardware):");
+            for (r = 0; r < N; r = r + 1) begin
+                $write("  ");
+                for (c = 0; c < N; c = c + 1) begin
+                    actual = $signed(result[((r*N+c)*ACCUM_WIDTH)+:ACCUM_WIDTH]);
+                    if (actual == C_exp[r][c]) begin
+                        $write("%4d ", actual);
+                    end else begin
+                        $write("%4d*", actual);
+                        $display("   [ERROR] C[%0d][%0d]: exp=%0d got=%0d", r, c, C_exp[r][c], actual);
+                        errors = errors + 1;
+                    end
+                end
+                $write("\n");
+            end
+            $display("Expected:");
+            for (r = 0; r < N; r = r + 1) begin
+                $write("  ");
+                for (c = 0; c < N; c = c + 1) $write("%4d ", C_exp[r][c]);
+                $write("\n");
+            end
+
+            if (errors == 0) begin
+                $display(">>> %s PASSED (all %0d elements correct)", test_name, N*N);
+            end else begin
+                $display(">>> %s FAILED with %0d / %0d errors", test_name, errors, N*N);
+            end
+            total_errors = total_errors + errors;
+
+            @(negedge clk); start = 0;
+            repeat (5) @(posedge clk);
+        end
+    endtask
+
+    task run_test_rnd;
+        input [1024:0] test_name;
+        input integer seed;
+        integer r, c, kk;
+        reg signed [DATA_WIDTH-1:0] a_val, b_val;
+        begin
+            $display("\n==================================================");
+            $display(" %s (N=%0d, seed=%0d)", test_name, N, seed);
+            $display("==================================================");
+
+            for (r = 0; r < N; r = r + 1) begin
+                for (c = 0; c < N; c = c + 1) begin
+                    a_val = ($random(seed) % 15) - 7;
+                    b_val = ($random(seed) % 15) - 7;
+                    A[r][c] = a_val;
+                    B[r][c] = b_val;
+                    C_exp[r][c] = 0;
+                end
+            end
+
+            for (r = 0; r < N; r = r + 1)
+                for (c = 0; c < N; c = c + 1)
+                    for (kk = 0; kk < N; kk = kk + 1)
+                        C_exp[r][c] = C_exp[r][c] + A[r][kk] * B[kk][c];
+
+            $display("Matrix A:");
+            for (r = 0; r < N; r = r + 1) begin
+                $write("  ");
+                for (c = 0; c < N; c = c + 1) $write("%4d ", A[r][c]);
+                $write("\n");
+            end
+            $display("Matrix B:");
+            for (r = 0; r < N; r = r + 1) begin
+                $write("  ");
+                for (c = 0; c < N; c = c + 1) $write("%4d ", B[r][c]);
+                $write("\n");
+            end
+            $display("Expected C = A*B:");
+            for (r = 0; r < N; r = r + 1) begin
+                $write("  ");
+                for (c = 0; c < N; c = c + 1) $write("%4d ", C_exp[r][c]);
+                $write("\n");
+            end
+
+            @(posedge clk);
+            start = 1;
+            wait(done);
+            @(negedge clk);
+
+            errors = 0;
+            $display("\nResult C (from hardware):");
+            for (r = 0; r < N; r = r + 1) begin
+                $write("  ");
+                for (c = 0; c < N; c = c + 1) begin
+                    actual = $signed(result[((r*N+c)*ACCUM_WIDTH)+:ACCUM_WIDTH]);
+                    if (actual == C_exp[r][c]) begin
+                        $write("%4d ", actual);
+                    end else begin
+                        $write("%4d*", actual);
+                        $display("   [ERROR] C[%0d][%0d]: exp=%0d got=%0d", r, c, C_exp[r][c], actual);
+                        errors = errors + 1;
+                    end
+                end
+                $write("\n");
+            end
+            $display("Expected:");
+            for (r = 0; r < N; r = r + 1) begin
+                $write("  ");
+                for (c = 0; c < N; c = c + 1) $write("%4d ", C_exp[r][c]);
+                $write("\n");
+            end
+
+            if (errors == 0) begin
+                $display(">>> %s PASSED (all %0d elements correct)", test_name, N*N);
+            end else begin
+                $display(">>> %s FAILED with %0d / %0d errors", test_name, errors, N*N);
+            end
+            total_errors = total_errors + errors;
+
+            @(negedge clk); start = 0;
+            repeat (5) @(posedge clk);
+        end
+    endtask
+
     initial begin
         $dumpfile("tb_system.vcd");
         $dumpvars(0, tb_system);
 
         clk = 0; rst = 1; start = 0;
         raw_a_col = 0; raw_b_row = 0;
+        total_errors = 0;
         #20 rst = 0;
         @(negedge clk);
         @(negedge clk);
 
-        // -------------------------------------------------------
-        // TEST 1: Fixed matrix
-        // -------------------------------------------------------
-        $display("==================================================");
-        $display(" TEST 1: N=%0d Fixed Matrix Multiply", N);
-        $display("==================================================");
-
-        A[0][0] =  4; A[0][1] = -3; A[0][2] =  3;
-        A[1][0] =  0; A[1][1] =  2; A[1][2] =  4;
-        A[2][0] =  5; A[2][1] =  5; A[2][2] = -3;
-
-        B[0][0] = -3; B[0][1] = -3; B[0][2] =  3;
-        B[1][0] = -3; B[1][1] =  5; B[1][2] =  3;
-        B[2][0] =  3; B[2][1] =  1; B[2][2] = -3;
-
-        for (i = 0; i < N; i = i + 1)
-            for (j = 0; j < N; j = j + 1)
-                C_exp[i][j] = 0;
-
-        for (i = 0; i < N; i = i + 1)
-            for (j = 0; j < N; j = j + 1)
-                for (k = 0; k < N; k = k + 1)
-                    C_exp[i][j] = C_exp[i][j] + A[i][k] * B[k][j];
-
-        $display("Matrix A:");
-        for (i = 0; i < N; i = i + 1) begin
-            $write("  ");
-            for (j = 0; j < N; j = j + 1) $write("%4d ", A[i][j]);
-            $write("\n");
-        end
-        $display("\nMatrix B:");
-        for (i = 0; i < N; i = i + 1) begin
-            $write("  ");
-            for (j = 0; j < N; j = j + 1) $write("%4d ", B[i][j]);
-            $write("\n");
-        end
-
-        // Debug expected values
-        $display("\nExpected C = A*B:");
-        for (i = 0; i < N; i = i + 1) begin
-            $write("  ");
-            for (j = 0; j < N; j = j + 1) $write("%4d ", C_exp[i][j]);
-            $write("\n");
-        end
-
-        @(posedge clk);
-        start = 1;
-        wait(done);
-        @(negedge clk);
-
-        errors = 0;
-        $display("\nReadout valid: %b", result_valid);
-        $display("\nMatrix C (result vs expected):");
-        for (i = 0; i < N; i = i + 1) begin
-            $write("  ");
-            for (j = 0; j < N; j = j + 1) begin
-                actual = $signed(result[((i*N+j)*ACCUM_WIDTH)+:ACCUM_WIDTH]);
-                if (actual == C_exp[i][j])
-                    $write("%4d ", actual);
-                else begin
-                    $write("%4d*", actual);
-                    errors = errors + 1;
-                end
-            end
-            $write("\n");
-        end
-        $display("\nExpected:");
-        for (i = 0; i < N; i = i + 1) begin
-            $write("  ");
-            for (j = 0; j < N; j = j + 1) $write("%4d ", C_exp[i][j]);
-            $write("\n");
-        end
-        if (errors == 0) $display("*** TEST 1 PASSED ***");
-        else             $display("*** TEST 1 FAILED with %0d errors ***", errors);
-
-        // -------------------------------------------------------
-        // TEST 2: Random
-        // -------------------------------------------------------
-        #100;
-        @(negedge clk); start = 0;
-        repeat (5) @(posedge clk);
-        @(negedge clk);
-
-        errors = 0;
+        run_test_det("SYSTEM TEST 1: Deterministic Matrix Multiply");
+        run_test_rnd("SYSTEM TEST 2: Random Matrix Multiply", 42);
+        run_test_rnd("SYSTEM TEST 3: Random Matrix Multiply", 99);
 
         $display("\n==================================================");
-        $display(" TEST 2: N=%0d Random Matrix Multiply", N);
-        $display("==================================================");
-
-        for (i = 0; i < N; i = i + 1)
-            for (j = 0; j < N; j = j + 1) begin
-                A[i][j] = ($random % 7) + 1;
-                B[i][j] = ($random % 7) + 1;
-                C_exp[i][j] = 0;
-            end
-
-        for (i = 0; i < N; i = i + 1)
-            for (j = 0; j < N; j = j + 1)
-                for (k = 0; k < N; k = k + 1)
-                    C_exp[i][j] = C_exp[i][j] + A[i][k] * B[k][j];
-
-        $display("Matrix A:");
-        for (i = 0; i < N; i = i + 1) begin
-            $write("  ");
-            for (j = 0; j < N; j = j + 1) $write("%4d ", A[i][j]);
-            $write("\n");
-        end
-        $display("\nMatrix B:");
-        for (i = 0; i < N; i = i + 1) begin
-            $write("  ");
-            for (j = 0; j < N; j = j + 1) $write("%4d ", B[i][j]);
-            $write("\n");
-        end
-
-        @(posedge clk);
-        start = 1;
-        wait(done);
-        @(negedge clk);
-
-        $display("\nMatrix C (Actual vs Expected):");
-        for (i = 0; i < N; i = i + 1) begin
-            $write("  ");
-            for (j = 0; j < N; j = j + 1) begin
-                actual = $signed(result[((i*N+j)*ACCUM_WIDTH)+:ACCUM_WIDTH]);
-                $write("%4d ", actual);
-                if (actual !== C_exp[i][j]) begin
-                    $display(" [ERROR at [%0d][%0d]: exp=%0d got=%0d]", i, j, C_exp[i][j], actual);
-                    errors = errors + 1;
-                end
-            end
-            $write("\n");
-        end
-
-        if (errors == 0) $display("*** TEST 2 PASSED ***");
-        else             $display("*** TEST 2 FAILED with %0d errors ***", errors);
-
-        $display("\n==================================================");
-        if (errors == 0) $display(" ALL SYSTEM TESTS PASSED ");
-        else             $display(" SYSTEM TESTS FAILED with %0d errors", errors);
+        if (total_errors == 0)
+            $display(" ALL %0d SYSTEM TESTS PASSED (N=%0d)", 3, N);
+        else
+            $display(" %0d SYSTEM TEST(S) FAILED with %0d total errors", 3, total_errors);
         $display("==================================================");
         $finish;
     end

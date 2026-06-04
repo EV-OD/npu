@@ -6,6 +6,16 @@ A purely combinational-wired N×N grid of `PE` tiles. Inputs (`in_left`, `in_top
 
 This module is the **uncontrolled** variant — all PEs accumulate freely on every clock. For the controlled version see `systolic_array_nxn_ctrl`.
 
+## Input → Output Transformation
+
+| Input | What it does | Output | What it represents |
+|-------|-------------|--------|--------------------|
+| `in_left[i]` | Routes to `PE(i,0).in_x` as column `i` of the A matrix | — | One column of A (flattened) |
+| `in_top[j]` | Routes to `PE(0,j).in_y` as row `j` of the B matrix | — | One row of B (flattened) |
+| — | Each `PE(i,j)` accumulates `Σ_k A[i][k] × B[k][j]` over successive feeds | `out_c[(i×N+j)]` | `C[i][j]` — one element of the result matrix |
+
+After N feeds plus pipeline drain, `out_c[(i×N+j)]` = `C[i][j]` = `Σ_k A[i][k] × B[k][j]`.
+
 ## Ports
 
 | Port      | Direction | Width                        | Description                        |
@@ -50,7 +60,7 @@ in_left[3]──►(3,0)────►(3,1)────►(3,2)────►(
 
 ## Data Flow
 
-The systolic array implements Cannon's algorithm variant for matrix multiplication:
+The systolic array implements a variant of Cannon's algorithm for matrix multiplication:
 
 ```
 C[i][j] = Σ_k A[i][k] × B[k][j]
@@ -70,6 +80,10 @@ Each PE adds 2 cycles of latency from `in_x`/`in_y` capture to `out_c` stabiliza
 - PE internal: 3 cycles (register → multiply → accumulate → out_c)
 
 Total from last feed entering the array to valid `out_c` at PE(N-1,N-1): approximately `4N` cycles.
+
+## Output Stationarity
+
+Each PE's `out_c` is a **registered output**. After the pipeline drains and no new data arrives, all `out_c` values hold their final accumulated results **indefinitely** (until the next `rst`). The complete C matrix is available in parallel on `out_c`.
 
 ## Limitations
 

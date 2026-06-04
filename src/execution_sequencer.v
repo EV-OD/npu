@@ -22,11 +22,13 @@ module execution_sequencer #(
     localparam LOAD   = 3'd2;
     localparam DRAIN  = 3'd3;
     localparam RDOUT  = 3'd4;
-    localparam DONE_S = 3'd5;
+    localparam SHIFT  = 3'd5;
+    localparam DONE_S = 3'd6;
 
     reg [2:0] state, next_state;
     reg [31:0] load_cycle;
     reg [31:0] drain_cnt;
+    reg [31:0] shift_cnt;
 
     always @(posedge clk) begin
         if (rst) state <= IDLE;
@@ -36,12 +38,13 @@ module execution_sequencer #(
     always @(*) begin
         next_state = state;
         case (state)
-            IDLE:   if (start)             next_state = CLEAR;
-            CLEAR:                          next_state = LOAD;
-            LOAD:   if (load_cycle == 2*N)  next_state = DRAIN;
+            IDLE:   if (start)                   next_state = CLEAR;
+            CLEAR:                                next_state = LOAD;
+            LOAD:   if (load_cycle == 2*N)        next_state = DRAIN;
             DRAIN:  if (drain_cnt == DRAIN_LIMIT) next_state = RDOUT;
-            RDOUT:                          next_state = DONE_S;
-            DONE_S: if (!start)             next_state = IDLE;
+            RDOUT:                                next_state = SHIFT;
+            SHIFT:  if (shift_cnt == N-1)         next_state = DONE_S;
+            DONE_S: if (!start)                   next_state = IDLE;
         endcase
     end
 
@@ -49,11 +52,13 @@ module execution_sequencer #(
         if (rst) begin
             load_cycle <= 0;
             drain_cnt  <= 0;
+            shift_cnt  <= 0;
         end else begin
             case (state)
-                CLEAR: begin load_cycle <= 0; drain_cnt <= 0; end
+                CLEAR: begin load_cycle <= 0; drain_cnt <= 0; shift_cnt <= 0; end
                 LOAD:  load_cycle <= load_cycle + 1;
                 DRAIN: drain_cnt <= drain_cnt + 1;
+                SHIFT: shift_cnt <= shift_cnt + 1;
             endcase
         end
     end
@@ -100,6 +105,13 @@ module execution_sequencer #(
             end else if (state == RDOUT) begin
                 acc_en  <= 0;
                 readout_trig <= 1;
+                busy    <= 1;
+                data_valid <= 0;
+                acc_clr <= 0;
+                done    <= 0;
+            end else if (state == SHIFT) begin
+                acc_en  <= 0;
+                readout_trig <= 0;
                 busy    <= 1;
                 data_valid <= 0;
                 acc_clr <= 0;

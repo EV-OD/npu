@@ -6,6 +6,20 @@ The skew buffer delays each row/column of the input data by `i × DELAY_PER_STEP
 
 Without skewing, all elements of a feed column/row would enter the array simultaneously, and the matrix multiplication would not produce correct results.
 
+## Input → Output Transformation
+
+| Input | What it does | Output | What it represents |
+|-------|-------------|--------|--------------------|
+| `din[i]` | Element `i` of the input vector passes through a shift register of length `i × DELAY_PER_STEP`; each register delays by 1 clock cycle | `dout[i]` | `din[i]` delayed by `i × DELAY_PER_STEP - 1` cycles |
+
+For row 0: pass-through (zero delay). For row i>0: the effective delay is `i × DELAY_PER_STEP - 1` cycles.
+
+The transformation applied is:
+
+```
+dout[i] at time t = din[i] at time t - (i × DELAY_PER_STEP - 1)
+```
+
 ## Ports
 
 | Port   | Direction | Width                 | Description                             |
