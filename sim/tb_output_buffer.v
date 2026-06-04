@@ -78,6 +78,72 @@ module tb_output_buffer;
         end
     endtask
 
+    task load_row_value;
+        input [ACCUM_WIDTH-1:0] value;
+        integer c;
+        begin
+            for (c = 0; c < N; c = c + 1)
+                row_in[(c*ACCUM_WIDTH) +: ACCUM_WIDTH] = value + c;
+        end
+    endtask
+
+    task verify_row_value;
+        input [ACCUM_WIDTH-1:0] value;
+        integer c;
+        integer errs;
+        begin
+            errs = 0;
+            for (c = 0; c < N; c = c + 1) begin
+                if ($signed(dout[(c*ACCUM_WIDTH) +: ACCUM_WIDTH]) != $signed(value + c)) begin
+                    $display("  FAIL: row[%0d] exp=%0d got=%0d @ %0t",
+                             c, value + c,
+                             $signed(dout[(c*ACCUM_WIDTH) +: ACCUM_WIDTH]), $time);
+                    errors = errors + 1;
+                    errs = errs + 1;
+                    fail_count = fail_count + 1;
+                end else begin
+                    pass_count = pass_count + 1;
+                end
+            end
+            if (errs == 0)
+                $display("  row correct (value base=%0d)", value);
+        end
+    endtask
+
+    task load_row_pattern;
+        input integer r;
+        input [31:0] base;
+        integer c;
+        begin
+            for (c = 0; c < N; c = c + 1)
+                row_in[(c*ACCUM_WIDTH) +: ACCUM_WIDTH] = (r + 1) * base + c;
+        end
+    endtask
+
+    task verify_row_pattern;
+        input integer r;
+        input [31:0] base;
+        integer c;
+        integer errs;
+        begin
+            errs = 0;
+            for (c = 0; c < N; c = c + 1) begin
+                if ($signed(dout[(c*ACCUM_WIDTH) +: ACCUM_WIDTH]) != (r + 1) * base + c) begin
+                    $display("  FAIL: row%0d[%0d] exp=%0d got=%0d @ %0t",
+                             r, c, (r + 1) * base + c,
+                             $signed(dout[(c*ACCUM_WIDTH) +: ACCUM_WIDTH]), $time);
+                    errors = errors + 1;
+                    errs = errs + 1;
+                    fail_count = fail_count + 1;
+                end else begin
+                    pass_count = pass_count + 1;
+                end
+            end
+            if (errs == 0)
+                $display("  row %0d correct (pattern base=%0d)", r, base);
+        end
+    endtask
+
     initial begin
         $dumpfile("tb_output_buffer.vcd");
         $dumpvars(0, tb_output_buffer);
@@ -91,7 +157,7 @@ module tb_output_buffer;
         $display("=== OUTPUT BUFFER TEST (N=%0d) ===", N);
         $display("");
 
-        // Test 1: Reset → all zeros
+        // Test 1: Reset -> all zeros
         $display("--- Test 1: Post-reset zeros ---");
         raddr = 0; #1;
         check("row0[0]=0", $signed(dout[0*ACCUM_WIDTH +: ACCUM_WIDTH]) == 0);
@@ -151,6 +217,147 @@ module tb_output_buffer;
             raddr = i;
             #1;
             verify_row(i, 200 + i);
+        end
+
+        // Test 6: Pong block write and read
+        $display("");
+        $display("--- Test 6: Pong block write and read ---");
+        for (i = 0; i < N; i = i + 1) begin
+            @(negedge clk);
+            load_row(i + N, 300 + i);
+            we = 1;
+            waddr = i + N;
+            ps();
+            we = 0;
+        end
+
+        for (i = 0; i < N; i = i + 1) begin
+            raddr = i + N;
+            #1;
+            verify_row(i + N, 300 + i);
+        end
+
+        // Test 7: Ping + Pong separation
+        $display("");
+        $display("--- Test 7: Ping+Pong separation ---");
+        for (i = 0; i < N; i = i + 1) begin
+            @(negedge clk);
+            load_row(i, 500 + i);
+            we = 1;
+            waddr = i;
+            ps();
+            we = 0;
+        end
+
+        for (i = 0; i < N; i = i + 1) begin
+            @(negedge clk);
+            load_row(i + N, 700 + i);
+            we = 1;
+            waddr = i + N;
+            ps();
+            we = 0;
+        end
+
+        for (i = 0; i < 2*N; i = i + 1) begin
+            raddr = i;
+            #1;
+            if (i < N)
+                verify_row(i, 500 + i);
+            else
+                verify_row(i, 700 + i - N);
+        end
+
+        // Test 8: Overlap write then verify isolation
+        $display("");
+        $display("--- Test 8: Overlap write isolation ---");
+        @(negedge clk);
+        load_row(0, 888);
+        we = 1;
+        waddr = 0;
+        ps();
+        we = 0;
+
+        @(negedge clk);
+        load_row(N, 999);
+        we = 1;
+        waddr = N;
+        ps();
+        we = 0;
+
+        raddr = 0;
+        #1;
+        verify_row(0, 888);
+
+        raddr = N;
+        #1;
+        verify_row(N, 999);
+
+        // Test 9: Full buffer sweep
+        $display("");
+        $display("--- Test 9: Full buffer sweep ---");
+        for (i = 0; i < 2*N; i = i + 1) begin
+            @(negedge clk);
+            load_row_pattern(i, 1000);
+            we = 1;
+            waddr = i;
+            ps();
+            we = 0;
+        end
+
+        for (i = 0; i < 2*N; i = i + 1) begin
+            raddr = i;
+            #1;
+            verify_row_pattern(i, 1000);
+        end
+
+        // Test 10: Write with we=0
+        $display("");
+        $display("--- Test 10: Write with we=0 ---");
+        raddr = 0;
+        #1;
+        verify_row_pattern(0, 1000);
+
+        @(negedge clk);
+        load_row_value(7777);
+        we = 0;
+        waddr = 0;
+        ps();
+
+        raddr = 0;
+        #1;
+        verify_row_pattern(0, 1000);
+
+        // Test 11: Partial row update (full-row overwrite)
+        $display("");
+        $display("--- Test 11: Partial row update (full-row overwrite) ---");
+        @(negedge clk);
+        for (j = 0; j < N; j = j + 1)
+            row_in[(j*ACCUM_WIDTH) +: ACCUM_WIDTH] = 111 + j;
+        we = 1;
+        waddr = 0;
+        ps();
+        we = 0;
+
+        raddr = 0;
+        #1;
+        verify_row_value(111);
+
+        // Test 12: Back-to-back writes without gaps
+        $display("");
+        $display("--- Test 12: Back-to-back writes ---");
+        for (i = 0; i < 2*N; i = i + 1) begin
+            @(negedge clk);
+            load_row_pattern(i, 2000);
+            we = 1;
+            waddr = i;
+        end
+        ps();
+        we = 0;
+
+        for (i = 0; i < 2*N; i = i + 1) begin
+            raddr = i;
+            #1;
+            verify_row_pattern(i, 2000);
         end
 
         $display("");
