@@ -2,68 +2,93 @@
 
 ## Overview
 
-The NPU core is a parameterizable systolic-array-based matrix multiplier designed for tiled matrix multiplication. It computes `C = A × B` where all matrices are N×N, with configurable data widths and accumulator widths.
+The NPU core (`system.v`) is a parameterizable systolic-array-based matrix multiplier with runtime-configurable tile size and ping-pong double-buffered input/output memories. It computes `C = A × B` where tiles are sub-regions of N×N matrices, with configurable data widths and accumulator widths.
 
-All intermediate and output values are **stationary** — they hold their state in registers until explicitly cleared or overwritten. The result matrix C is available in parallel on `result` once `done` is asserted.
+All intermediate and output values are **stationary** — they hold their state in registers until explicitly cleared or overwritten. The result matrix C is available row-by-row from the output buffer once `done` is asserted.
 
 ## Input → Output Transformation
 
 | External Input | Internal path | External Output | Final result |
 |----------------|---------------|-----------------|--------------|
-| `raw_a_col` (one column of A per feed, N elements, flattened) | → skew_a → systolic array in_left | `result` (N×N × ACCUM_WIDTH, flattened) | `C[i][j]` = Σ_k A[i][k] × B[k][j] |
-| `raw_b_row` (one row of B per feed, N elements, flattened) | → skew_b → systolic array in_top | `result_valid` | High while `result` holds valid C matrix |
-| `start` | → execution_sequencer → FSM control | `done` | Operation complete |
-| | | `seq_data_valid`, `seq_data_idx` | Feed handshake for external data source |
+| `act_din` (element → activation buffer) | → feed buffer (COL_MAJOR) → skew_a → systolic array in_left | `out_dout` (one row of C at `out_raddr`, N elements, async read) | `C[i][j]` = Σ_k A[i][k] × B[k][j] |
+| `wgt_din` (element → weight buffer) | → feed buffer (row major) → skew_b → systolic array in_top | `done` | Operation complete |
+| `start` | → execution_sequencer → FSM control | | |
+| `matrix_size[31:0]` | tile dimension (1..N), latched at start | | |
+| `act_base[31:0]` | activation column offset, latched for feed | | |
+| `wgt_base[31:0]` | weight row offset, latched for feed | | |
+| `out_base[31:0]` | output row offset, latched at readout_trig | | |
 
 ## Block Diagram
 
 ```
-                  ┌──────────────────────────────────────────────────┐
-                  │              npu_core                            │
-                  │                                                  │
-  start ─────────►│  ┌──────────────────────────────────────┐       │
-                  │  │   execution_sequencer               │       │
-  seq_data_valid ◄──┤  - state machine                    │       │
-  seq_data_idx   ◄──┤  - data_valid/data_idx generation   │       │
-                  │  │  - acc_clr, acc_en, readout_trig    │       │
-                  │  │  - busy, done                      │       │
-                  │  └──┬───────────┬──────────┬──────────┘       │
-                  │     │           │          │                  │
-                  │  acc_clr    acc_en   readout_trig            │
-                  │     │           │          │                  │
- raw_a_col ───────►│  ┌──▼───────┐ ┌─▼──────────▼──────┐          │
-                  │  │skew_a    │ │  systolic_array   │          │
- raw_b_row ───────►│  │skew_b    │ │  _nxn_ctrl       │          │
-                  │  └────┬─────┘ │  (N×N PE_ctrl)   │          │
-                  │       │       │                   │          │
-                  │       └──────►│ in_left/in_top    │          │
-                  │               │                   │          │
-                  │               └───────┬───────────┘          │
-                  │                       │ pe_c (N² × ACCUM)   │
-                  │               ┌───────▼───────────┐          │
-                  │               │ readout_shifter   │          │
-                  │               │ (parallel load,   │          │
-                  │               │  row-by-row shift)│          │
-                  │               └───────┬───────────┘          │
-                  │               row_out │ (N × ACCUM)          │
-                  │               ┌───────▼───────────┐          │
-                  │               │   readout_unit    │          │
-  result_valid ◄──┤               │                   │          │
-  result      ◄──┤               └───────────────────┘          │
-                  │                                                  │
-  done ◄──────────┤                                                  │
-                  └──────────────────────────────────────────────────┘
+                  ┌───────────────────────────────────────────────────────┐
+                  │                 system                                │
+                  │                                                       │
+  act_we ─────────┤  ┌─────────────────────────────┐                     │
+  act_waddr ──────┤  │   feed_buffer act_buf       │                     │
+  act_din ────────┤  │   (COL_MAJOR=1, 2×N×N deep) │                     │
+                  │  └──────────┬──────────────────┘                     │
+  wgt_we ─────────┤  ┌──────────▼──────────────────┐                     │
+  wgt_waddr ──────┤  │   feed_buffer wgt_buf       │                     │
+  wgt_din ────────┤  │   (COL_MAJOR=0, 2×N×N deep) │                     │
+                  │  └──────────┬──────────────────┘                     │
+                  │             │                                         │
+                  │    act_feed_idx = data_idx + act_base                 │
+                  │    wgt_feed_idx = data_idx + wgt_base                 │
+                  │             │                                         │
+                  │  ┌──────────▼──────────────────┐                     │
+                  │  │   negedge register          │                     │
+                  │  │   (data_feed_active gate)   │                     │
+                  │  └──────────┬──────────────────┘                     │
+                  │             │                                         │
+  start ──────────┤  ┌──────────▼──────────┬──────────┐                  │
+                  │  │   skew_a           │ skew_b   │                  │
+                  │  │   (delay 2×i)      │ (delay 2×j)│                │
+                  │  └──────────┬──────────┴────┬─────┘                  │
+                  │             │               │                         │
+                  │  ┌──────────▼───────────────▼──────┐                  │
+                  │  │   systolic_array_nxn_ctrl       │                  │
+                  │  │   (N×N PE_ctrl)                 │                  │
+                  │  └──────────┬──────────────────────┘                  │
+                  │             │ pe_c (N² × ACCUM)                      │
+                  │  ┌──────────▼──────────────────────┐                  │
+                  │  │   readout_shifter               │                  │
+                  │  │   (parallel load, row shift)    │                  │
+                  │  └──────────┬──────────────────────┘                  │
+                  │             │ shift_row (N × ACCUM)                   │
+                  │  ┌──────────▼──────────┐  ┌───────────────────┐      │
+                  │  │   readout_unit      │  │  output_buffer    │      │
+                  │  │   (internal, unused │  │  (2×N×N deep,     │      │
+                  │  │    outputs)         │  │   row-level IO)   │      │
+                  │  └─────────────────────┘  └────┬──────────────┘      │
+                  │                                │                      │
+  done ◄──────────┤                                │                      │
+  out_raddr ──────┤                                │                      │
+  out_dout ◄──────┘                                │                      │
+                   └────────────────────────────────┘
 ```
 
 ## Data Flow
 
+### 0. Buffer Preload (External)
+
+Before starting a computation, the testbench/memory interface preloads the activation and weight buffers element-by-element:
+
+- **Activation buffer** (`act_buf`, COL_MAJOR=1): stores `A[r][c]` at linear address `r × N + c`. The feed reads column `act_base + feed_idx` — each column `N` gives one N-element column of A.
+- **Weight buffer** (`wgt_buf`, COL_MAJOR=0): stores `B[r][c]` at linear address `r × N + c`. The feed reads row `wgt_base + feed_idx` — each row gives one N-element row of B.
+
+Both buffers are **2×N×N deep** to support ping-pong double-buffering. The Ping block occupies addresses `0..N×N-1`, the Pong block `N×N..2×N×N-1`. Bases `0..N-1` select Ping, bases `N..2N-1` select Pong.
+
 ### 1. Feed Generation
 
-The `execution_sequencer` drives `data_valid` and `data_idx` to indicate which column/row pair to feed next. External logic (testbench or memory interface) uses these signals to drive `raw_a_col` and `raw_b_row` with one column of A and one row of B each cycle.
+The `execution_sequencer` drives `data_valid` and `data_idx` to indicate which column/row pair to feed next. The feed control logic computes:
+
+- `act_feed_idx = data_idx + act_base` — selects a column from the activation buffer
+- `wgt_feed_idx = data_idx + wgt_base` — selects a row from the weight buffer
 
 Feed `k` provides:
-- `raw_a_col` = `A[:, k]` (column k of A, N elements)
-- `raw_b_row` = `B[k, :]` (row k of B, N elements)
+- `raw_a_col = A[:, k]` (column k of the tile, N elements)
+- `raw_b_row = B[k, :]` (row k of the tile, N elements)
 
 ### 2. Skew Buffering
 
@@ -82,27 +107,35 @@ PE(i,j) accumulates: Σ_k A[i][k] × B[k][j]
 
 ### 4. Drain
 
-After all N feeds, the sequencer enters DRAIN, keeping `acc_en=1` while the last data propagates through the pipeline.
+After all M feeds, the sequencer enters DRAIN, keeping `acc_en=1` while the last data propagates through the pipeline.
 
 ### 5. Readout Shift
 
-When the pipeline is fully drained, `readout_trig` pulses for 1 cycle, causing the `readout_shifter` to parallel-capture all N×N accumulator values from the array into N internal row registers. The sequencer then enters the SHIFT state, which lasts N cycles. During each SHIFT cycle, the shifter outputs one row (N elements) to the `readout_unit`.
+When the pipeline is fully drained, `readout_trig` pulses for 1 cycle, causing the `readout_shifter` to parallel-capture all N×N accumulator values from the array into N internal row registers. The sequencer then enters the SHIFT state, which lasts M cycles. During each SHIFT cycle, the shifter outputs one row (N elements).
 
-### 6. Result Assembly
+### 6. Output Buffer Write
 
-The `readout_unit` collects one row per cycle over N cycles. On the last row, it assembles the full N×N result matrix and asserts `valid`. The sequencer transitions to DONE_S, asserting `done`.
+Each SHIFT cycle writes one row into the `output_buffer` at address `out_waddr` (starting from `out_base`, incremented each cycle). The output buffer is **2×N×N deep**:
+
+- Ping block: rows 0..N-1 (`out_base = 0`)
+- Pong block: rows N..2N-1 (`out_base = N`)
+
+After the last SHIFT cycle, the sequencer asserts `done`. The result is read asynchronously via `out_raddr` / `out_dout`.
 
 ## Component Hierarchy
 
 ```
-npu_core
-├── execution_sequencer        (FSM controller)
-├── skew_buffer  #skew_a       (A-column skew)
-├── skew_buffer  #skew_b       (B-row skew)
-├── systolic_array_nxn_ctrl    (controlled array)
-│   └── PE_ctrl × N×N         (processing elements)
-├── readout_shifter            (parallel load, row-by-row shift)
-└── readout_unit               (row collection + result assembly)
+system
+├── execution_sequencer              (FSM controller)
+├── feed_buffer    #act_buf          (activation memory, COL_MAJOR, 2×N×N)
+├── feed_buffer    #wgt_buf          (weight memory, row major, 2×N×N)
+├── skew_buffer    #skew_a           (A-column skew)
+├── skew_buffer    #skew_b           (B-row skew)
+├── systolic_array_nxn_ctrl          (controlled array)
+│   └── PE_ctrl × N×N               (processing elements)
+├── readout_shifter                  (parallel load, row-by-row shift)
+├── readout_unit                     (row collection, internal only)
+└── output_buffer                    (result memory, 2×N×N)
 ```
 
 ## Pipeline Stages
@@ -110,52 +143,104 @@ npu_core
 | Stage | Cycles | Description |
 |-------|--------|-------------|
 | CLEAR | 1 | Reset all accumulators to 0 |
-| LOAD | `2N` | Feed N column-row pairs (every 2 cycles) |
-| DRAIN | `4N` (auto) | Wait for pipeline to drain |
+| LOAD | `2M` | Feed M column-row pairs (every 2 cycles) |
+| DRAIN | `4M` (auto) | Wait for pipeline to drain |
 | RDOUT | 1 | Load shifter with all PE accumulator values |
-| SHIFT | `N` | Stream rows from shifter → readout unit |
+| SHIFT | `M` | Stream rows from shifter → output buffer |
 | DONE | until `!start` | Hold done flag |
+
+(M = runtime `matrix_size`, 1 ≤ M ≤ N)
 
 ## Latency
 
 Total cycles from `start` to `done`:
 
 ```
-L_total = 1 + 2N + 4N + 1 + N + 1 = 7N + 3
+L_total = 1 + 2M + 4M + 1 + M + 1 = 7M + 3
 ```
 
-For N=4: 31 cycles. For N=8: 59 cycles.
+For M=4: 31 cycles. For M=8: 59 cycles.
 
-## Parameters (all tied together)
+## Parameters
 
-The `npu_core` module exposes the same parameters as its sub-modules:
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `N` | 4 | Physical matrix dimension (array size) |
+| `DATA_WIDTH` | 16 | Element bit width |
+| `ACCUM_WIDTH` | 40 | Accumulator bit width |
 
-| Parameter | Default | Sub-modules affected |
-|-----------|---------|---------------------|
-| `N` | 4 | All |
-| `DATA_WIDTH` | 16 | `PE_ctrl`, `skew_buffer` |
-| `ACCUM_WIDTH` | 40 | `PE_ctrl`, `readout_shifter`, `readout_unit` |
+## Runtime Configuration (inputs, latched at `start`)
+
+| Port | Width | Description |
+|------|-------|-------------|
+| `matrix_size` | 32 | Tile dimension M (1..N) |
+| `act_base` | 32 | Activation column offset for sub-tile / ping-pong |
+| `wgt_base` | 32 | Weight row offset for sub-tile / ping-pong |
+| `out_base` | 32 | Output row offset for sub-tile / ping-pong |
+
+## Buffer Interface
+
+| Port | Direction | Width | Description |
+|------|-----------|-------|-------------|
+| `act_we` | input | 1 | Activation buffer write enable |
+| `act_waddr` | input | `$clog2(2·N·N)` | Element write address |
+| `act_din` | input | `DATA_WIDTH` | Element write data |
+| `wgt_we` | input | 1 | Weight buffer write enable |
+| `wgt_waddr` | input | `$clog2(2·N·N)` | Element write address |
+| `wgt_din` | input | `DATA_WIDTH` | Element write data |
+| `out_raddr` | input | `$clog2(2·N)` | Row read address (async) |
+| `out_dout` | output | `N × ACCUM_WIDTH` | Row read data (async) |
 
 ## Interface Protocol
 
-1. Assert `start` for at least one posedge
-2. On each `data_valid` posedge, read `data_idx` and provide `raw_a_col` / `raw_b_row` at the following negedge
-3. Wait for `done` on posedge; `result` and `result_valid` are available
-4. Deassert `start` to return sequencer to IDLE for the next operation
+1. Preload activation/weight buffers via `act_we`/`wgt_we` (Ping or Pong block)
+2. Set `matrix_size`, `act_base`, `wgt_base`, `out_base`
+3. Assert `start` for at least one posedge
+4. Sequencer auto-runs through CLEAR → LOAD → DRAIN → RDOUT → SHIFT → DONE
+5. Wait for `done` posedge
+6. Read result rows via `out_raddr` / `out_dout` (async, no clock needed between reads)
+7. To restart with new data: preload the other buffer block, flip bases, pulse `start`
+
+## Ping-Pong Double Buffering
+
+Each feed/output buffer is 2×N×N deep to support overlap of computation and preload:
+
+1. **Preload Ping block** (addresses `0..N·N-1` for elements, bases `0..N-1` for rows/columns)
+2. **Start compute** with bases pointing to Ping block
+3. **While computing**, preload Pong block (addresses `N·N..2·N·N-1`, bases `N..2N-1`)
+4. **Wait for done**, read Ping result from output (`out_base=0`, `out_raddr=0..M-1`)
+5. **Flip**: set bases to Pong, start next compute
+6. **While computing**, preload Ping block with next tile's data
 
 ## Verification
 
-The testbench (`tb_system.v`) runs three tests per N:
+The testbench (`tb_system.v`) runs per N:
 
-1. **Deterministic matrix** (values derived from indices, verified against reference computation)
-2. **Random matrix** (seed 42, random values, all elements compared)
-3. **Random matrix** (seed 99, independent random values)
+1. **Full deterministic** (values derived from indices, verified against reference)
+2. **Full random** (seed 42)
+3. **Full random** (seed 99)
+4. **Sub-tile M=2** (deterministic, tile fits within N×N)
+5. **Sub-tile M=2** (random)
+6. **Sub-tile M=2 with non-zero base offsets** (act_base=1, wgt_base=1, out_base=1)
+7. **Ping-pong double buffer**: preload Ping → compute → preload Pong while computing → verify Ping → flip bases → compute Pong → verify Pong
 
-All N from 2 to 8 pass with the default configuration.
+All N from 2 to 4 pass with the default configuration.
+
+## Memory Map (buffer addressing)
+
+Each buffer is 2×N×N elements deep:
+
+| Block | Address range | Base value |
+|-------|--------------|------------|
+| Ping (A/B) | `0 .. N·N-1` | 0 |
+| Pong (A/B) | `N·N .. 2·N·N-1` | N |
+
+Base values are interpreted per buffer:
+- **Activation feed** (`act_base`): selects column `act_base + data_idx` — Ping for bases 0..N-1, Pong for bases N..2N-1
+- **Weight feed** (`wgt_base`): selects row `wgt_base + data_idx`
+- **Output write** (`out_base`): starts output row address at `out_base`, increments per shift
 
 ## Output Stationarity
-
-All results in this system are **stationary**:
 
 | Module | Output | Stationary? | Why |
 |--------|--------|-------------|-----|
@@ -164,3 +249,5 @@ All results in this system are **stationary**:
 | `readout_shifter` | `row_out` | Yes | Internal row registers hold until overwritten by next `load` |
 | `readout_unit` | `result` | Yes | Assembled from shifter rows, held until next readout |
 | `execution_sequencer` | `done` | Yes | Held until `start` deasserted |
+| `feed_buffer` | `dout` | Async | Combinational read from mem (changes with raddr) |
+| `output_buffer` | `dout` | Async | Combinational read from mem (changes with raddr) |

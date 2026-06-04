@@ -151,6 +151,8 @@ module tb_sequencer;
         // -------------------------------------------------------
         $display("");
         $display("--- Phase 7: DONE_S ---");
+        // Deassert start immediately so next_state transitions to IDLE
+        @(negedge clk); start = 0;
         ps();  // DONE_S
         check("DONE: done=1", done == 1);
         check("DONE: busy=0", busy == 0);
@@ -163,13 +165,36 @@ module tb_sequencer;
         // -------------------------------------------------------
         $display("");
         $display("--- Phase 8: Return to IDLE ---");
-        @(negedge clk); start = 0;
-        ps();  // state IDLE (outputs from DONE_S)
+        // next_state was recomputed to IDLE (start=0) at the negedge
+        ps();  // state transitions DONE_S -> IDLE
         ps();  // state IDLE
         check("IDLE again: busy=0", busy == 0);
         check("IDLE again: done=0", done == 0);
         check("IDLE again: acc_en=0", acc_en == 0);
         check("IDLE again: data_valid=0", data_valid == 0);
+
+        // -------------------------------------------------------
+        // Restart from IDLE (ping-pong style: pulse start)
+        // -------------------------------------------------------
+        $display("");
+        $display("--- Phase 9: Restart from IDLE ---");
+        // Pulse start for 1 cycle (like ping-pong testbench)
+        @(negedge clk); start = 1;
+        ps();  // posedge: state=IDLE, next_state=CLEAR (start=1)
+        @(negedge clk); start = 0;
+        ps();  // posedge: state=CLEAR
+        check("CLEAR after restart: acc_clr=1", acc_clr == 1);
+        check("CLEAR after restart: busy=1", busy == 1);
+        ps();  // LOAD entry: data_valid=1, data_idx=0
+        check("LOAD entry: data_valid=1", data_valid == 1);
+        check("LOAD entry: data_idx=0", data_idx == 0);
+        // Let the sequencer run to completion
+        wait(done);
+        check("DONE after restart: done=1", done == 1);
+        ps();  // DONE_S -> IDLE (start already 0)
+        ps();  // DONE_S -> IDLE (next_state=IDLE since start=0)
+        ps();  // IDLE
+        check("IDLE after restart: busy=0", busy == 0);
 
         // -------------------------------------------------------
         // Summary

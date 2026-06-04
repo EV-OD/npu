@@ -58,6 +58,10 @@ result       XXXXXXXXXXXXXXXXXXXXXXXXXXX[ C ]XX
 
 Once assembled, `result` holds until the next readout operation. Since `pe_c` is captured by the shipper before the readout unit starts collecting rows, the array outputs can be released while the shift-out is in progress.
 
+## Integration Note
+
+In the current `system.v`, `readout_unit` is instantiated but its outputs (`valid`, `result`) are **not connected** to the top-level ports. The actual result output is the `output_buffer`, which captures one row per SHIFT cycle and provides an async read port (`out_raddr` / `out_dout`). The `readout_unit` is retained for test/debug visibility.
+
 ## Usage
 
 ```verilog
