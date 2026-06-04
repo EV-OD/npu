@@ -1,10 +1,11 @@
 module execution_sequencer #(
     parameter N = 4,
-    parameter DRAIN_CYCLES = 0  // 0 = auto (3*N), else fixed
+    parameter DRAIN_CYCLES = 0  // 0 = auto (4*matrix_size), else fixed
 )(
     input  wire         clk,
     input  wire         rst,
     input  wire         start,
+    input  wire [31:0]  matrix_size,  // runtime tile dimension (1..N)
 
     output reg          data_valid,
     output reg [31:0]   data_idx,
@@ -15,7 +16,13 @@ module execution_sequencer #(
     output reg          done
 );
 
-    localparam DRAIN_LIMIT = (DRAIN_CYCLES == 0) ? (4*N) : DRAIN_CYCLES;
+    reg [31:0] M;  // latched matrix_size
+    always @(posedge clk) begin
+        if (rst) M <= N;
+        else if (start) M <= matrix_size;
+    end
+
+    wire [31:0] drain_limit = (DRAIN_CYCLES == 0) ? (4*M) : DRAIN_CYCLES;
 
     localparam IDLE   = 3'd0;
     localparam CLEAR  = 3'd1;
@@ -38,13 +45,14 @@ module execution_sequencer #(
     always @(*) begin
         next_state = state;
         case (state)
-            IDLE:   if (start)                   next_state = CLEAR;
-            CLEAR:                                next_state = LOAD;
-            LOAD:   if (load_cycle == 2*N)        next_state = DRAIN;
-            DRAIN:  if (drain_cnt == DRAIN_LIMIT) next_state = RDOUT;
-            RDOUT:                                next_state = SHIFT;
-            SHIFT:  if (shift_cnt == N-1)         next_state = DONE_S;
-            DONE_S: if (!start)                   next_state = IDLE;
+            IDLE:   if (start)                    next_state = CLEAR;
+            CLEAR:                                 next_state = LOAD;
+            LOAD:   if (load_cycle == 2*M)         next_state = DRAIN;
+            DRAIN:  if (drain_cnt == drain_limit)  next_state = RDOUT;
+            RDOUT:                                 next_state = SHIFT;
+            SHIFT:  if (shift_cnt == M-1)          next_state = DONE_S;
+            DONE_S: if (start)                     next_state = CLEAR;
+                    else                            next_state = IDLE;
         endcase
     end
 
@@ -89,14 +97,14 @@ module execution_sequencer #(
                 done    <= 0;
             end else if (state == LOAD) begin
                 data_idx   <= load_cycle / 2;
-                data_valid <= (load_cycle % 2 == 0) && (load_cycle < 2*N);
+                data_valid <= (load_cycle % 2 == 0) && (load_cycle < 2*M);
                 acc_en     <= 1;
                 busy    <= 1;
                 acc_clr <= 0;
                 readout_trig <= 0;
                 done    <= 0;
             end else if (state == DRAIN) begin
-                acc_en  <= 1;  // keep accumulating during drain
+                acc_en  <= 1;
                 busy    <= 1;
                 data_valid <= 0;
                 readout_trig <= 0;

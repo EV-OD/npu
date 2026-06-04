@@ -9,8 +9,11 @@ module tb_sequencer;
     wire [31:0] data_idx;
     wire acc_clr, acc_en, readout_trig, busy, done;
 
+    wire [31:0] matrix_size = N;  // default to full size for existing tests
+
     execution_sequencer #(.N(N)) uut (
         .clk(clk), .rst(rst), .start(start),
+        .matrix_size(matrix_size),
         .data_valid(data_valid), .data_idx(data_idx),
         .acc_clr(acc_clr), .acc_en(acc_en),
         .readout_trig(readout_trig),

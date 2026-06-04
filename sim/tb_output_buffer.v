@@ -7,9 +7,9 @@ module tb_output_buffer;
 
     reg clk, rst;
     reg we;
-    reg [$clog2(N)-1:0] waddr;
+    reg [$clog2(2*N)-1:0] waddr;
     reg signed [(N*ACCUM_WIDTH)-1:0] row_in;
-    reg [$clog2(N)-1:0] raddr;
+    reg [$clog2(2*N)-1:0] raddr;
     wire signed [(N*ACCUM_WIDTH)-1:0] dout;
 
     output_buffer #(.N(N), .ACCUM_WIDTH(ACCUM_WIDTH)) uut (

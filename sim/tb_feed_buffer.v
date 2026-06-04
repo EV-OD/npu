@@ -7,9 +7,9 @@ module tb_feed_buffer;
 
     reg clk, rst;
     reg we;
-    reg [$clog2(N*N)-1:0] waddr;
+    reg [$clog2(2*N*N)-1:0] waddr;
     reg signed [DATA_WIDTH-1:0] din;
-    reg [$clog2(N)-1:0] raddr;
+    reg [$clog2(2*N)-1:0] raddr;
     wire signed [(N*DATA_WIDTH)-1:0] dout;
 
     feed_buffer #(.N(N), .DATA_WIDTH(DATA_WIDTH)) uut (

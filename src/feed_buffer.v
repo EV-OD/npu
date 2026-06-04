@@ -8,19 +8,19 @@ module feed_buffer #(
 
     // Element-level write port (for preload)
     input  wire                                we,
-    input  wire [$clog2(N*N)-1:0]              waddr,
+    input  wire [$clog2(2*N*N)-1:0]            waddr,
     input  wire signed [DATA_WIDTH-1:0]        din,
 
     // Row-level async read port (for feed)
-    input  wire [$clog2(N)-1:0]                raddr,
+    input  wire [$clog2(2*N)-1:0]              raddr,
     output wire signed [(N*DATA_WIDTH)-1:0]    dout
 );
 
-    reg signed [DATA_WIDTH-1:0] mem [0:N*N-1];
+    reg signed [DATA_WIDTH-1:0] mem [0:2*N*N-1];
 
     integer i;
     initial begin
-        for (i = 0; i < N*N; i = i + 1)
+        for (i = 0; i < 2*N*N; i = i + 1)
             mem[i] = {DATA_WIDTH{1'b0}};
     end
 
@@ -28,17 +28,20 @@ module feed_buffer #(
         if (we) mem[waddr] <= din;
     end
 
+    wire [$clog2(2*N*N)-1:0] pong_base = raddr >= N ? N*N : 0;
+    wire [$clog2(N)-1:0] r_adj = raddr >= N ? raddr - N : raddr;
+
     genvar j;
     generate
         if (COL_MAJOR) begin
-            // Column read: dout[j] = mem[j*N + raddr]
+            // Column read: dout[j] = mem[pong_base + j*N + r_adj]
             for (j = 0; j < N; j = j + 1) begin
-                assign dout[(j*DATA_WIDTH) +: DATA_WIDTH] = mem[j*N + raddr];
+                assign dout[(j*DATA_WIDTH) +: DATA_WIDTH] = mem[pong_base + j*N + r_adj];
             end
         end else begin
-            // Row read: dout[j] = mem[raddr*N + j]
+            // Row read: dout[j] = mem[pong_base + r_adj*N + j]
             for (j = 0; j < N; j = j + 1) begin
-                assign dout[(j*DATA_WIDTH) +: DATA_WIDTH] = mem[raddr*N + j];
+                assign dout[(j*DATA_WIDTH) +: DATA_WIDTH] = mem[pong_base + r_adj*N + j];
             end
         end
     endgenerate

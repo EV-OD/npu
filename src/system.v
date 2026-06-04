@@ -7,18 +7,24 @@ module system #(
     input  wire                                     rst,
     input  wire                                     start,
 
+    // Runtime configuration (latched at start)
+    input  wire [31:0]                              matrix_size,  // tile dimension (1..N)
+    input  wire [31:0]                              act_base,     // activation column offset
+    input  wire [31:0]                              wgt_base,     // weight row offset
+    input  wire [31:0]                              out_base,     // output row offset
+
     // Activation buffer write (preload)
     input  wire                                     act_we,
-    input  wire [$clog2(N*N)-1:0]                   act_waddr,
+    input  wire [$clog2(2*N*N)-1:0]                 act_waddr,
     input  wire signed [DATA_WIDTH-1:0]             act_din,
 
     // Weight buffer write (preload)
     input  wire                                     wgt_we,
-    input  wire [$clog2(N*N)-1:0]                   wgt_waddr,
+    input  wire [$clog2(2*N*N)-1:0]                 wgt_waddr,
     input  wire signed [DATA_WIDTH-1:0]             wgt_din,
 
     // Output buffer read (result, row-level async)
-    input  wire [$clog2(N)-1:0]                     out_raddr,
+    input  wire [$clog2(2*N)-1:0]                   out_raddr,
     output wire signed [(N*ACCUM_WIDTH)-1:0]        out_dout,
 
     // Status
@@ -32,6 +38,7 @@ module system #(
 
     execution_sequencer #(.N(N)) seq (
         .clk(clk), .rst(rst), .start(start),
+        .matrix_size(matrix_size),
         .data_valid(data_valid), .data_idx(data_idx),
         .acc_clr(acc_clr), .acc_en(acc_en),
         .readout_trig(readout_trig),
@@ -40,18 +47,18 @@ module system #(
 
     // Feed buffers
     wire signed [(N*DATA_WIDTH)-1:0] act_dout, wgt_dout;
-    reg [31:0] feed_idx;
+    reg [$clog2(2*N)-1:0] act_feed_idx, wgt_feed_idx;
 
     feed_buffer #(.N(N), .DATA_WIDTH(DATA_WIDTH), .COL_MAJOR(1)) act_buf (
         .clk(clk), .rst(rst),
         .we(act_we), .waddr(act_waddr), .din(act_din),
-        .raddr(feed_idx), .dout(act_dout)
+        .raddr(act_feed_idx), .dout(act_dout)
     );
 
     feed_buffer #(.N(N), .DATA_WIDTH(DATA_WIDTH), .COL_MAJOR(0)) wgt_buf (
         .clk(clk), .rst(rst),
         .we(wgt_we), .waddr(wgt_waddr), .din(wgt_din),
-        .raddr(feed_idx), .dout(wgt_dout)
+        .raddr(wgt_feed_idx), .dout(wgt_dout)
     );
 
     // Feed control
@@ -61,16 +68,16 @@ module system #(
     always @(posedge clk) begin
         if (rst) begin
             data_feed_active <= 0;
-            feed_idx <= 0;
+            act_feed_idx <= 0;
+            wgt_feed_idx <= 0;
         end else begin
             data_feed_active <= data_valid;
-            feed_idx <= data_idx;
+            act_feed_idx <= data_idx + act_base;
+            wgt_feed_idx <= data_idx + wgt_base;
         end
     end
 
-    // Register feed data at negedge (matching original tb_system timing)
-    // data_feed_active is stable after posedge NBA; at negedge it reflects
-    // the current feed cycle and the feed buffers' async output is captured.
+    // Register feed data at negedge
     always @(negedge clk) begin
         if (rst) begin
             raw_a_col <= 0;
@@ -115,7 +122,7 @@ module system #(
         .row_out(shift_row), .row_valid(shift_valid), .shift_done()
     );
 
-    // Readout unit (assembles full result for external use)
+    // Readout unit (assembles full result)
     wire rdout_valid;
     wire [(N*N*ACCUM_WIDTH)-1:0] rdout_result;
 
@@ -128,18 +135,18 @@ module system #(
     );
 
     // Output buffer: write one row per SHIFT cycle
-    // we is combinational (NBA would miss first row); waddr is registered
+    // we is combinational; waddr is registered starting at out_base
     wire        out_we;
-    reg [$clog2(N)-1:0] out_waddr;
+    reg [$clog2(2*N)-1:0] out_waddr;
 
-    assign out_we = shift_valid && !readout_trig;
+    assign out_we = shift_valid && !readout_trig && !done;
 
     always @(posedge clk) begin
         if (rst) begin
             out_waddr <= 0;
         end else if (readout_trig) begin
-            out_waddr <= 0;
-        end else if (shift_valid) begin
+            out_waddr <= out_base;
+        end else if (shift_valid && !done) begin
             out_waddr <= out_waddr + 1;
         end
     end

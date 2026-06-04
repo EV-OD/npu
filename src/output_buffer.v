@@ -7,19 +7,19 @@ module output_buffer #(
 
     // Row-level write port (from readout)
     input  wire                                we,
-    input  wire [$clog2(N)-1:0]                waddr,
+    input  wire [$clog2(2*N)-1:0]              waddr,
     input  wire signed [(N*ACCUM_WIDTH)-1:0]   row_in,
 
     // Row-level async read port (for verification / DMA)
-    input  wire [$clog2(N)-1:0]                raddr,
+    input  wire [$clog2(2*N)-1:0]              raddr,
     output wire signed [(N*ACCUM_WIDTH)-1:0]   dout
 );
 
-    reg signed [ACCUM_WIDTH-1:0] mem [0:N*N-1];
+    reg signed [ACCUM_WIDTH-1:0] mem [0:2*N*N-1];
     integer i, j;
 
     initial begin
-        for (i = 0; i < N*N; i = i + 1)
+        for (i = 0; i < 2*N*N; i = i + 1)
             mem[i] = {ACCUM_WIDTH{1'b0}};
     end
 
