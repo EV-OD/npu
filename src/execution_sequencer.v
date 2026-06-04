@@ -1,5 +1,6 @@
 module execution_sequencer #(
-    parameter N = 4
+    parameter N = 4,
+    parameter DRAIN_CYCLES = 0  // 0 = auto (3*N), else fixed
 )(
     input  wire         clk,
     input  wire         rst,
@@ -13,6 +14,8 @@ module execution_sequencer #(
     output reg          busy,
     output reg          done
 );
+
+    localparam DRAIN_LIMIT = (DRAIN_CYCLES == 0) ? (4*N) : DRAIN_CYCLES;
 
     localparam IDLE   = 3'd0;
     localparam CLEAR  = 3'd1;
@@ -36,7 +39,7 @@ module execution_sequencer #(
             IDLE:   if (start)             next_state = CLEAR;
             CLEAR:                          next_state = LOAD;
             LOAD:   if (load_cycle == 2*N)  next_state = DRAIN;
-            DRAIN:  if (drain_cnt == 3*N)   next_state = RDOUT;
+            DRAIN:  if (drain_cnt == DRAIN_LIMIT) next_state = RDOUT;
             RDOUT:                          next_state = DONE_S;
             DONE_S: if (!start)             next_state = IDLE;
         endcase

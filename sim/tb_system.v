@@ -220,6 +220,8 @@ module tb_system;
         repeat (5) @(posedge clk);
         @(negedge clk);
 
+        errors = 0;
+
         $display("\n==================================================");
         $display(" TEST 2: N=%0d Random Matrix Multiply", N);
         $display("==================================================");

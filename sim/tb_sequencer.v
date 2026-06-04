@@ -81,9 +81,9 @@ module tb_sequencer;
 
         // ---- DRAIN ----
         ps();  // state DRAIN (outputs LOAD)
-        repeat (3*N) begin
+        repeat (4*N) begin
             ps();
-            check("DRAIN: acc_en=0",      acc_en     == 0);
+            check("DRAIN: acc_en=1",      acc_en     == 1);
             check("DRAIN: data_valid=0",  data_valid == 0);
             check("DRAIN: readout_trig=0",readout_trig == 0);
         end

@@ -5,14 +5,18 @@ module tb_readout;
     parameter N = 3;
     parameter ACCUM_WIDTH = 40;
 
-    reg clk, rst, trigger;
+    reg clk, rst, trigger, shift_mode;
     reg [(N*N*ACCUM_WIDTH)-1:0] pe_c;
     wire valid;
     wire [(N*N*ACCUM_WIDTH)-1:0] result;
+    wire shift_valid;
+    wire [ACCUM_WIDTH-1:0] shift_out;
+    wire shift_done;
 
     readout_unit #(.N(N), .ACCUM_WIDTH(ACCUM_WIDTH)) uut (
-        .clk(clk), .rst(rst), .trigger(trigger),
-        .pe_c(pe_c), .valid(valid), .result(result)
+        .clk(clk), .rst(rst), .trigger(trigger), .shift_mode(shift_mode),
+        .pe_c(pe_c), .valid(valid), .result(result),
+        .shift_valid(shift_valid), .shift_out(shift_out), .shift_done(shift_done)
     );
 
     always #5 clk = ~clk;
@@ -33,7 +37,6 @@ module tb_readout;
         end
     endtask
 
-    // Wait for posedge + settle
     task ps;
         begin
             @(posedge clk);
@@ -74,41 +77,66 @@ module tb_readout;
         $dumpfile("tb_readout.vcd");
         $dumpvars(0, tb_readout);
 
-        clk = 0; rst = 1; trigger = 0; pe_c = 0;
+        clk = 0; rst = 1; trigger = 0; shift_mode = 0; pe_c = 0;
         errors = 0;
         #15 rst = 0;
         ps();
 
         $display("=== READOUT UNIT TEST ===");
 
-        // Post-reset
+        // ---- Test 1: Parallel mode (shift_mode=0) ----
+        $display("--- Test 1: Parallel capture ---");
         check("reset: valid=0", valid == 0);
         check("reset: result=0", result == 0);
 
-        // Load PE values and trigger capture
         load_pe_values(100);
         @(negedge clk);
         trigger = 1;
-        ps();  // capture happens here
+        ps();
         trigger = 0;
 
         check("triggered: valid=1", valid == 1);
         verify_values(100);
 
-        // Change pe_c and verify result holds old values
         pe_c = 0;
         ps();
         check("hold: valid still 1", valid == 1);
         verify_values(100);
 
-        // Re-trigger with new values
         load_pe_values(200);
         @(negedge clk);
         trigger = 1;
         ps();
         trigger = 0;
-
         verify_values(200);
+
+        // ---- Test 2: Serial shift-out mode (shift_mode=1) ----
+        $display("\n--- Test 2: Serial shift-out ---");
+        load_pe_values(300);
+        @(negedge clk);
+        shift_mode = 1;
+        trigger = 1;
+        ps();
+        trigger = 0;
+
+        check("shift: valid=1", valid == 1);
+        check("shift: shift_valid=1 on first word", shift_valid == 1);
+        check("shift: shift_out[0]=300", $signed(shift_out) == 300);
+
+        // Shift out remaining N*N-1 words
+        for (i = 1; i < N*N; i = i + 1) begin
+            ps();
+            msg_str = "shift_valid during shift";
+            check(msg_str, shift_valid == 1);
+            msg_str = "shift_out value during shift";
+            check(msg_str, $signed(shift_out) == (i+1)*300);
+        end
+
+        ps();
+        check("shift: cycle done, shift_valid=0", shift_valid == 0);
+        check("shift: shift_done=1", shift_done == 1);
+        check("shift: parallel result unchanged", valid == 1);
+        verify_values(300);
 
         $display("");
         if (errors == 0)
