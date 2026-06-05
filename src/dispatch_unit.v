@@ -240,9 +240,15 @@ module dispatch_unit #(
                     state_debug <= RELEASE;
                     if (num_tiles > 0) begin
                         dep_release_en <= 1;
-                        dep_release_a <= wt_tile;
-                        dep_release_b <= act_tile;
-                        dep_release_c <= out_tile;
+                        if (opcode == `OP_LOAD || opcode == `OP_STORE) begin
+                            dep_release_a <= ls_buf_tile;
+                            dep_release_b <= 0;
+                            dep_release_c <= 0;
+                        end else begin
+                            dep_release_a <= wt_tile;
+                            dep_release_b <= act_tile;
+                            dep_release_c <= out_tile;
+                        end
                         dep_release_num <= num_tiles;
                     end
                 end
