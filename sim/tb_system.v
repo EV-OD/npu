@@ -1,360 +1,233 @@
 `timescale 1ns / 1ps
+`include "../src/instruction_defines.vh"
 
 module tb_system;
 
-    parameter N = 3;
-    parameter DATA_WIDTH = 16;
-    parameter ACCUM_WIDTH = 40;
+    parameter SLOT_DEPTH = 64;
+    parameter NUM_TILES  = 64;
 
-    reg clk, rst, start;
-    reg [31:0] matrix_size, act_base, wgt_base, out_base;
-    reg act_we, wgt_we;
-    reg [$clog2(2*N*N)-1:0] act_waddr, wgt_waddr;
-    reg signed [DATA_WIDTH-1:0] act_din, wgt_din;
-    reg [$clog2(2*N)-1:0] out_raddr;
-    wire signed [(N*ACCUM_WIDTH)-1:0] out_dout;
-    wire done;
+    reg clk, rst;
+    reg dma_en, dma_we;
+    reg [6:0] dma_addr;
+    reg [31:0] dma_din;
 
-    system #(.N(N), .DATA_WIDTH(DATA_WIDTH), .ACCUM_WIDTH(ACCUM_WIDTH)) uut (
-        .clk(clk), .rst(rst), .start(start),
-        .matrix_size(matrix_size), .act_base(act_base),
-        .wgt_base(wgt_base), .out_base(out_base),
-        .act_we(act_we), .act_waddr(act_waddr), .act_din(act_din),
-        .wgt_we(wgt_we), .wgt_waddr(wgt_waddr), .wgt_din(wgt_din),
-        .out_raddr(out_raddr), .out_dout(out_dout),
-        .done(done)
+    reg sys_busy, sys_done;
+    wire sys_start;
+    wire [31:0] sys_matrix_size, sys_act_base, sys_wgt_base, sys_out_base;
+
+    wire active_slot, ibram_ready;
+    wire busy;
+    wire [3:0] state_debug, opcode_debug;
+    wire [NUM_TILES-1:0] lock_status;
+
+    system #(.SLOT_DEPTH(SLOT_DEPTH), .NUM_TILES(NUM_TILES)) u_sys (
+        .clk(clk), .rst(rst),
+        .dma_en(dma_en), .dma_we(dma_we),
+        .dma_addr(dma_addr), .dma_din(dma_din),
+        .sys_busy(sys_busy), .sys_done(sys_done),
+        .sys_start(sys_start),
+        .sys_matrix_size(sys_matrix_size),
+        .sys_act_base(sys_act_base),
+        .sys_wgt_base(sys_wgt_base),
+        .sys_out_base(sys_out_base),
+        .active_slot(active_slot),
+        .ibram_ready(ibram_ready),
+        .busy(busy),
+        .state_debug(state_debug),
+        .opcode_debug(opcode_debug),
+        .lock_status(lock_status)
     );
 
     always #5 clk = ~clk;
 
-    reg signed [DATA_WIDTH-1:0] A [0:N-1][0:N-1];
-    reg signed [DATA_WIDTH-1:0] B [0:N-1][0:N-1];
-    reg signed [ACCUM_WIDTH-1:0] C_exp [0:N-1][0:N-1];
-    reg signed [DATA_WIDTH-1:0] A2 [0:N-1][0:N-1];
-    reg signed [DATA_WIDTH-1:0] B2 [0:N-1][0:N-1];
-    reg signed [ACCUM_WIDTH-1:0] C_exp2 [0:N-1][0:N-1];
-    reg signed [ACCUM_WIDTH-1:0] actual;
+    integer errors, pass_count, fail_count;
 
-    integer i, j, k, errors, total_errors;
-    integer seed;
+    task check;
+        input string msg;
+        input cond;
+        begin
+            if (cond) pass_count = pass_count + 1;
+            else begin
+                $display("  FAIL: %s @ %0t", msg, $time);
+                errors = errors + 1; fail_count = fail_count + 1;
+            end
+        end
+    endtask
 
     task ps;
-        begin
-            @(posedge clk);
-            #1;
-        end
+        begin @(posedge clk); #1; end
     endtask
 
-    task start_compute;
+    task dma_write;
+        input [6:0] addr;
+        input [31:0] data;
         begin
-            #1;
-            start = 1;
-            @(posedge clk);
-            #1;
-            start = 0;
-        end
-    endtask
-
-    task run_system_test;
-        input [1024:0] test_name;
-        input integer M;       // tile size
-        input integer ab;      // act base (column offset)
-        input integer wb;      // wgt base (row offset)
-        input integer ob;      // out base (row offset)
-        input integer det;     // 0=deterministic, else=seed
-        integer r, c, kk;
-        reg signed [DATA_WIDTH-1:0] a_val, b_val;
-        begin
-            $display("");
-            $display("==================================================");
-            $display(" %s  (N=%0d, M=%0d, ab=%0d, wb=%0d, ob=%0d)", test_name, N, M, ab, wb, ob);
-            $display("==================================================");
-
-            seed = det;
-            for (r = 0; r < M; r = r + 1)
-                for (c = 0; c < M; c = c + 1) begin
-                    if (det == 0) begin
-                        a_val = (r * M + c + 1) * 2 - 5;
-                        b_val = (c * M + r + 1) * 2 - 5;
-                    end else begin
-                        a_val = ($random(seed) % 15) - 7;
-                        b_val = ($random(seed) % 15) - 7;
-                    end
-                    A[r][c] = a_val;
-                    B[r][c] = b_val;
-                end
-
-            $display("Matrix A (%0dx%0d):", M, M);
-            for (r = 0; r < M; r = r + 1) begin
-                $write("  ");
-                for (c = 0; c < M; c = c + 1) $write("%4d ", A[r][c]);
-                $write("\n");
-            end
-            $display("Matrix B (%0dx%0d):", M, M);
-            for (r = 0; r < M; r = r + 1) begin
-                $write("  ");
-                for (c = 0; c < M; c = c + 1) $write("%4d ", B[r][c]);
-                $write("\n");
-            end
-
-            for (r = 0; r < M; r = r + 1)
-                for (c = 0; c < M; c = c + 1) begin
-                    C_exp[r][c] = 0;
-                    for (kk = 0; kk < M; kk = kk + 1)
-                        C_exp[r][c] = C_exp[r][c] + A[r][kk] * B[kk][c];
-                end
-
-            $display("Expected C = A*B:");
-            for (r = 0; r < M; r = r + 1) begin
-                $write("  ");
-                for (c = 0; c < M; c = c + 1) $write("%4d ", C_exp[r][c]);
-                $write("\n");
-            end
-
-            // Set runtime config
-            matrix_size = M;
-            act_base = ab;
-            wgt_base = wb;
-            out_base = ob;
-
-            // Preload tile into buffers (A with COL_MAJOR base=ab means column ab is first feed)
-            // For activation COL_MAJOR: element at buffer (row r, col c) is stored at r*N + c.
-            // The feed reads column (ab + feed_idx). The columns/rows must map to tile rows/cols 0..M-1.
-            // We store tile row r, column c at buffer row r, column (ab + c) for activation,
-            // and buffer row (wb + r), column c for weight.
-            $display("Loading buffers...");
-            for (r = 0; r < M; r = r + 1)
-                for (c = 0; c < M; c = c + 1) begin
-                    @(negedge clk);
-                    act_we = 1;
-                    act_waddr = r * N + (ab + c);
-                    act_din = A[r][c];
-                    ps();
-                    act_we = 0;
-                end
-
-            for (r = 0; r < M; r = r + 1)
-                for (c = 0; c < M; c = c + 1) begin
-                    @(negedge clk);
-                    wgt_we = 1;
-                    wgt_waddr = (wb + r) * N + c;
-                    wgt_din = B[r][c];
-                    ps();
-                    wgt_we = 0;
-                end
-
-            start_compute;
-            wait(done);
             @(negedge clk);
-            $display("Done! Checking output buffer...");
-
-            errors = 0;
-            for (r = 0; r < M; r = r + 1) begin
-                out_raddr = ob + r;
-                #1;
-                for (c = 0; c < M; c = c + 1) begin
-                    actual = $signed(out_dout[(c*ACCUM_WIDTH) +: ACCUM_WIDTH]);
-                    if (actual == C_exp[r][c]) begin
-                        $write("%4d ", actual);
-                    end else begin
-                        $write("%4d*", actual);
-                        $display("   [ERROR] C[%0d][%0d]: exp=%0d got=%0d", r, c, C_exp[r][c], actual);
-                        errors = errors + 1;
-                    end
-                end
-                $write("\n");
-            end
-            $display("Expected:");
-            for (r = 0; r < M; r = r + 1) begin
-                $write("  ");
-                for (c = 0; c < M; c = c + 1) $write("%4d ", C_exp[r][c]);
-                $write("\n");
-            end
-
-            if (errors == 0)
-                $display(">>> %s PASSED (all %0d elements correct)", test_name, M*M);
-            else
-                $display(">>> %s FAILED with %0d / %0d errors", test_name, errors, M*M);
-            total_errors = total_errors + errors;
-
-            repeat (5) @(posedge clk);
+            dma_en <= 1; dma_we <= 1; dma_addr <= addr; dma_din <= data;
+            @(posedge clk); #1;
+            dma_en <= 0; dma_we <= 0;
         end
     endtask
+
+    // Mock execution unit (4-cycle exec)
+    reg [3:0] exec_count;
+    reg exec_active;
+    always @(posedge clk) begin
+        if (rst) begin
+            exec_active <= 0; exec_count <= 0;
+            sys_busy <= 0; sys_done <= 0;
+        end else begin
+            sys_done <= 0;
+            if (sys_start) begin
+                exec_active <= 1; exec_count <= 4; sys_busy <= 1;
+            end
+            if (exec_active) begin
+                if (exec_count == 0) begin
+                    exec_active <= 0; sys_busy <= 0; sys_done <= 1;
+                end else begin
+                    exec_count <= exec_count - 1;
+                end
+            end
+        end
+    end
 
     initial begin
         $dumpfile("tb_system.vcd");
         $dumpvars(0, tb_system);
 
-        clk = 0; rst = 1; start = 0;
-        act_we = 0; wgt_we = 0;
-        act_waddr = 0; wgt_waddr = 0;
-        act_din = 0; wgt_din = 0;
-        out_raddr = 0;
-        matrix_size = N; act_base = 0; wgt_base = 0; out_base = 0;
-        total_errors = 0;
+        clk = 0; rst = 1;
+        dma_en = 0; dma_we = 0; dma_addr = 0; dma_din = 0;
+        errors = 0; pass_count = 0; fail_count = 0;
 
-        #18 rst = 0;
+        #18 rst = 0; ps();
+
+        $display("=== SYSTEM INTEGRATION TEST ===");
+        $display("");
+
+        // ── Program IBRAM ───────────────────────────────────────────────
+        $display("Loading IBRAM...");
+
+        // Slot A:
+        //   0: MATMUL(wt=1, act=2, out=3)
+        //   1: MATMUL(wt=1, act=5, out=6)
+        //   2: MATMUL(wt=7, act=8, out=9)
+        //   3: NOP
+        //   4-63: NOP
+
+        dma_write(0, {`OP_MATMUL, 8'h01, 8'h02, 8'h03, 4'h0});
+        dma_write(1, {`OP_MATMUL, 8'h01, 8'h05, 8'h06, 4'h0});
+        dma_write(2, {`OP_MATMUL, 8'h07, 8'h08, 8'h09, 4'h0});
+        dma_write(3, {`OP_NOP, 28'h0});
+        for (integer i = 4; i < SLOT_DEPTH; i = i + 1)
+            dma_write(i, {`OP_NOP, 28'h0});
+
+        $display("  Slot A loaded (%0d words)", SLOT_DEPTH);
+
+        for (integer i = 0; i < SLOT_DEPTH; i = i + 1)
+            dma_write(SLOT_DEPTH + i, {`OP_NOP, 28'h0});
+
+        $display("  Slot B loaded (%0d words)", SLOT_DEPTH);
+        $display("  ibram_ready=%0d (will be 1 after cycle)", ibram_ready);
+        ps(); check("ibram_ready after DMA", ibram_ready == 1);
+
+        // ─────────────────────────────────────────────────────────────────
+        // Test 1: MATMUL(1,2,3) — full lifecycle with dep checker
+        //   State transitions:
+        //     DECODE_W → CHECK (×3, dep processing) → DISPATCH → WAIT(×7)
+        //     → RELEASE
+        // ─────────────────────────────────────────────────────────────────
+        $display("");
+        $display("--- Test 1: MATMUL(1,2,3) — full lifecycle ---");
+        ps(); // IDLE (stays IDLE — ibram_ready NBA pending)
+        ps(); // FETCH
+        ps(); // DECODE_W
+        check("T1: DECODE_W, opcode=MATMUL", state_debug==2 && opcode_debug==`OP_MATMUL);
+
+        // CHECK #1: dep_check_en asserted (NBA), dep not yet processed
         ps();
+        check("T1: CHECK(1)", state_debug == 3);
 
-        // Full N×N tests
-        run_system_test("TEST 1: Full deterministic", N, 0, 0, 0, 0);
-        run_system_test("TEST 2: Full random", N, 0, 0, 0, 42);
-        run_system_test("TEST 3: Full random", N, 0, 0, 0, 99);
+        // CHECK #2: dep processes grant, tiles lock
+        ps();
+        check("T1: CHECK(2) dep grant", state_debug == 3);
+        check("T1: tiles locked", lock_status[1] && lock_status[2] && lock_status[3]);
 
-        // Sub-tile tests (M < N) — only if N > 2
-        if (N > 2) begin
-            run_system_test("TEST 4: Sub-tile M=2 deterministic", 2, 0, 0, 0, 0);
-            run_system_test("TEST 5: Sub-tile M=2 random", 2, 0, 0, 0, 77);
-            run_system_test("TEST 6: Sub-tile M=2 offset (ab=1,wb=1,ob=1)", 2, 1, 1, 1, 0);
-        end
+        // CHECK #3: dispatch sees dep_grant=1, nxt→DISPATCH
+        ps();
+        check("T1: CHECK(3) → DISPATCH pending", state_debug == 3);
 
-        // ============================================================
-        // PING-PONG DOUBLE BUFFER TEST
-        // ============================================================
+        // DISPATCH
+        ps();
+        check("T1: DISPATCH, sys_start", state_debug==4 && sys_start==1);
+        check("T1: wgt=1 act=2 out=3", sys_wgt_base==1 && sys_act_base==2 && sys_out_base==3);
+
+        // WAIT_EXEC ×7 + RELEASE
+        repeat (7) ps();
+        ps(); // RELEASE(6)
+        check("T1: RELEASE state", state_debug == 6);
+        ps(); // FETCH — dep processes release here
+        check("T1: tiles released", lock_status[1]==0 && lock_status[2]==0 && lock_status[3]==0);
+
+        // ─────────────────────────────────────────────────────────────────
+        // Test 2: MATMUL(1,5,6) — sequential (no conflict, T1 released)
+        // ─────────────────────────────────────────────────────────────────
+        $display("--- Test 2: MATMUL(1,5,6) — sequential ---");
+        ps(); // DECODE_W (already in DECODE_W after T1's release check ps)
+        check("T2: DECODE_W, opcode=MATMUL", state_debug==2 && opcode_debug==`OP_MATMUL);
+        repeat (3) ps(); // CHECK ×3
+        check("T2: tiles locked", lock_status[1] && lock_status[5] && lock_status[6]);
+        ps(); // DISPATCH
+        check("T2: DISPATCH, sys_start", state_debug==4 && sys_start==1);
+        check("T2: wgt=1 act=5 out=6", sys_wgt_base==1 && sys_act_base==5 && sys_out_base==6);
+        repeat (7) ps();
+        ps(); // RELEASE(6)
+        check("T2: RELEASE state", state_debug == 6);
+        ps(); // FETCH — dep processes release
+        check("T2: tiles released", lock_status[1]==0 && lock_status[5]==0 && lock_status[6]==0);
+
+        // ─────────────────────────────────────────────────────────────────
+        // Test 3: MATMUL(7,8,9) — sequential
+        // ─────────────────────────────────────────────────────────────────
+        $display("--- Test 3: MATMUL(7,8,9) — sequential ---");
+        ps(); // DECODE_W (already in DECODE_W after T2's FETCH ps)
+        check("T3: DECODE_W, opcode=MATMUL", state_debug==2 && opcode_debug==`OP_MATMUL);
+        repeat (3) ps();
+        check("T3: tiles locked", lock_status[7] && lock_status[8] && lock_status[9]);
+        ps(); // DISPATCH
+        check("T3: DISPATCH, sys_start", state_debug==4 && sys_start==1);
+        check("T3: wgt=7 act=8 out=9", sys_wgt_base==7 && sys_act_base==8 && sys_out_base==9);
+        repeat (7) ps();
+        ps(); // RELEASE(6)
+        check("T3: RELEASE state", state_debug == 6);
+        ps(); // FETCH — dep processes release
+        check("T3: tiles released", lock_status[7]==0 && lock_status[8]==0 && lock_status[9]==0);
+
+        // ─────────────────────────────────────────────────────────────────
+        // Test 4: NOP — no dep check, quick passthrough
+        //   State: DECODE_W → CHECK → DISPATCH → FETCH
+        // ─────────────────────────────────────────────────────────────────
+        $display("--- Test 4: NOP passthrough ---");
+        ps(); // DECODE_W (already in DECODE_W after T3's release check ps)
+        check("T4: DECODE_W, opcode=NOP", state_debug==2 && opcode_debug==`OP_NOP);
+        ps(); // CHECK (1 cycle only — NOP skips dep wait)
+        check("T4: CHECK", state_debug == 3);
+        ps(); // DISPATCH
+        ps(); // FETCH done
+        check("T4: NOP completed", state_debug == 1);
+        check("T4: pc advanced", u_sys.u_dispatch.pc > 3);
+
+        // ─────────────────────────────────────────────────────────────────
+        // Summary
+        // ─────────────────────────────────────────────────────────────────
         $display("");
-        $display("==================================================");
-        $display(" PING-PONG DOUBLE BUFFER TEST (N=%0d)", N);
-        $display("==================================================");
-        $display("");
-
-        // Generate matrix 1 (Ping) — place in A, B
-        $display("Generating matrix 1 (Ping)...");
-        for (i = 0; i < N; i = i + 1)
-            for (j = 0; j < N; j = j + 1) begin
-                A[i][j] = (i * N + j + 1) * 2 - 5;
-                B[i][j] = (j * N + i + 1) * 2 - 5;
-            end
-
-        for (i = 0; i < N; i = i + 1)
-            for (j = 0; j < N; j = j + 1) begin
-                C_exp[i][j] = 0;
-                for (k = 0; k < N; k = k + 1)
-                    C_exp[i][j] = C_exp[i][j] + A[i][k] * B[k][j];
-            end
-
-        // Preload Ping block
-        $display("Preloading Ping block (activations)...");
-        for (i = 0; i < N; i = i + 1)
-            for (j = 0; j < N; j = j + 1) begin
-                @(negedge clk);
-                act_we = 1;
-                act_waddr = i * N + j;
-                act_din = A[i][j];
-                ps(); act_we = 0;
-            end
-
-        $display("Preloading Ping block (weights)...");
-        for (i = 0; i < N; i = i + 1)
-            for (j = 0; j < N; j = j + 1) begin
-                @(negedge clk);
-                wgt_we = 1;
-                wgt_waddr = i * N + j;
-                wgt_din = B[i][j];
-                ps(); wgt_we = 0;
-            end
-
-        // Generate matrix 2 (Pong) — place in A2, B2
-        $display("Generating matrix 2 (Pong)...");
-        for (i = 0; i < N; i = i + 1)
-            for (j = 0; j < N; j = j + 1) begin
-                A2[i][j] = 100 + (i * N + j + 1) * 2 - 5;
-                B2[i][j] = 100 + (j * N + i + 1) * 2 - 5;
-            end
-
-        for (i = 0; i < N; i = i + 1)
-            for (j = 0; j < N; j = j + 1) begin
-                C_exp2[i][j] = 0;
-                for (k = 0; k < N; k = k + 1)
-                    C_exp2[i][j] = C_exp2[i][j] + A2[i][k] * B2[k][j];
-            end
-
-        // Start compute on Ping block (bases = 0)
-        matrix_size = N; act_base = 0; wgt_base = 0; out_base = 0;
-        $display("Compute started on Ping block (bases=0)...");
-        start_compute;
-
-        // While computing, preload Pong block into the second half of buffers
-        $display("Preloading Pong block while Ping computes...");
-        for (i = 0; i < N; i = i + 1)
-            for (j = 0; j < N; j = j + 1) begin
-                @(negedge clk);
-                act_we = 1;
-                act_waddr = N*N + i * N + j;  // Pong activation block
-                act_din = A2[i][j];
-                ps(); act_we = 0;
-            end
-
-        for (i = 0; i < N; i = i + 1)
-            for (j = 0; j < N; j = j + 1) begin
-                @(negedge clk);
-                wgt_we = 1;
-                wgt_waddr = N*N + i * N + j;  // Pong weight block
-                wgt_din = B2[i][j];
-                ps(); wgt_we = 0;
-            end
-
-        // Wait for Ping computation to finish
-        wait(done);
-        @(negedge clk);
-        $display("Ping done! Verifying result...");
-
-        errors = 0;
-        for (i = 0; i < N; i = i + 1) begin
-            out_raddr = i;
-            #1;
-            for (j = 0; j < N; j = j + 1) begin
-                actual = $signed(out_dout[(j*ACCUM_WIDTH) +: ACCUM_WIDTH]);
-                if (actual !== C_exp[i][j]) begin
-                    $display("  [ERROR] Ping C[%0d][%0d]: exp=%0d got=%0d", i, j, C_exp[i][j], actual);
-                    errors = errors + 1;
-                end
-            end
-        end
-        if (errors == 0)
-            $display(">>> Ping result CORRECT (all %0d elements)", N*N);
+        $display("--- RESULTS ---");
+        $display("  Checks: %0d passed, %0d failed, %0d total",
+                 pass_count, fail_count, pass_count + fail_count);
+        if (errors === 0)
+            $display("*** SYSTEM INTEGRATION TEST PASSED ***");
         else
-            $display(">>> Ping result FAILED with %0d errors", errors);
-        total_errors = total_errors + errors;
-
-        // Start compute on Pong block (bases = N)
-        matrix_size = N; act_base = N; wgt_base = N; out_base = N;
-        $display("Compute started on Pong block (bases=N=%0d)...", N);
-        start_compute;
-        wait(done);
-        @(negedge clk);
-        $display("Pong done! Verifying result...");
-
-        errors = 0;
-        for (i = 0; i < N; i = i + 1) begin
-            out_raddr = N + i;
-            #1;
-            for (j = 0; j < N; j = j + 1) begin
-                actual = $signed(out_dout[(j*ACCUM_WIDTH) +: ACCUM_WIDTH]);
-                if (actual !== C_exp2[i][j]) begin
-                    $display("  [ERROR] Pong C[%0d][%0d]: exp=%0d got=%0d", i, j, C_exp2[i][j], actual);
-                    errors = errors + 1;
-                end
-            end
-        end
-        if (errors == 0)
-            $display(">>> Pong result CORRECT (all %0d elements)", N*N);
-        else
-            $display(">>> Pong result FAILED with %0d errors", errors);
-        total_errors = total_errors + errors;
-
-        if (total_errors == 0)
-            $display(">>> PING-PONG TEST PASSED");
-        else
-            $display(">>> PING-PONG TEST FAILED");
-
-        $display("");
-        $display("==================================================");
-        if (total_errors == 0)
-            $display(" ALL %0d SYSTEM TESTS PASSED (N=%0d)", (N > 2) ? 6 : 3, N);
-        else
-            $display(" %0d SYSTEM TEST(S) FAILED with %0d total errors", (N > 2) ? 6 : 3, total_errors);
-        $display("==================================================");
-        $finish;
+            $display("*** SYSTEM INTEGRATION TEST FAILED ***");
+        #100 $finish;
     end
 
 endmodule

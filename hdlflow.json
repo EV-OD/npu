@@ -6,6 +6,7 @@
     "verilog": "v2005"
   },
   "paths": {
+    "include_dirs": ["src/**/*.vh"],
     "source_dirs": ["src/**/*.v"],
     "testbench_dirs": ["sim/**/*.v"],
     "output_dir": "build"
