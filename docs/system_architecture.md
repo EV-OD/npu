@@ -2,135 +2,144 @@
 
 ## Overview
 
-The NPU core (`system.v`) is a parameterizable systolic-array-based matrix multiplier with runtime-configurable tile size and ping-pong double-buffered input/output memories. It computes `C = A × B` where tiles are sub-regions of N×N matrices, with configurable data widths and accumulator widths.
+The NPU core consists of two major subsystems:
 
-All intermediate and output values are **stationary** — they hold their state in registers until explicitly cleared or overwritten. The result matrix C is available row-by-row from the output buffer once `done` is asserted.
+1. **Instruction Pipeline** (`system.v`): Fetches, decodes, and dispatches 32-bit instructions. Manages tile-level dependencies and controls instruction sequencing (linear, loop, jump). Exposes a standard execution-unit handshake (`sys_start`/`sys_done`).
 
-## Input → Output Transformation
+2. **Systolic Datapath** (`execution_sequencer.v` + `systolic_array_nxn_ctrl.v` + ...): Implements the matrix multiply engine: N×N processing elements, feed buffers, skew buffers, readout shifter, and output buffer.
 
-| External Input | Internal path | External Output | Final result |
-|----------------|---------------|-----------------|--------------|
-| `act_din` (element → activation buffer) | → feed buffer (COL_MAJOR) → skew_a → systolic array in_left | `out_dout` (one row of C at `out_raddr`, N elements, async read) | `C[i][j]` = Σ_k A[i][k] × B[k][j] |
-| `wgt_din` (element → weight buffer) | → feed buffer (row major) → skew_b → systolic array in_top | `done` | Operation complete |
-| `start` | → execution_sequencer → FSM control | | |
-| `matrix_size[31:0]` | tile dimension (1..N), latched at start | | |
-| `act_base[31:0]` | activation column offset, latched for feed | | |
-| `wgt_base[31:0]` | weight row offset, latched for feed | | |
-| `out_base[31:0]` | output row offset, latched at readout_trig | | |
+The instruction pipeline is the top-level orchestrator. The systolic datapath receives tile numbers and a `sys_start` pulse, executes the matrix multiply, and asserts `sys_done` when complete.
 
-## Block Diagram
+## System Block Diagram (`system.v`)
 
 ```
-                  ┌───────────────────────────────────────────────────────┐
-                  │                 system                                │
-                  │                                                       │
-  act_we ─────────┤  ┌─────────────────────────────┐                     │
-  act_waddr ──────┤  │   feed_buffer act_buf       │                     │
-  act_din ────────┤  │   (COL_MAJOR=1, 2×N×N deep) │                     │
-                  │  └──────────┬──────────────────┘                     │
-  wgt_we ─────────┤  ┌──────────▼──────────────────┐                     │
-  wgt_waddr ──────┤  │   feed_buffer wgt_buf       │                     │
-  wgt_din ────────┤  │   (COL_MAJOR=0, 2×N×N deep) │                     │
-                  │  └──────────┬──────────────────┘                     │
-                  │             │                                         │
-                  │    act_feed_idx = data_idx + act_base                 │
-                  │    wgt_feed_idx = data_idx + wgt_base                 │
-                  │             │                                         │
-                  │  ┌──────────▼──────────────────┐                     │
-                  │  │   negedge register          │                     │
-                  │  │   (data_feed_active gate)   │                     │
-                  │  └──────────┬──────────────────┘                     │
-                  │             │                                         │
-  start ──────────┤  ┌──────────▼──────────┬──────────┐                  │
-                  │  │   skew_a           │ skew_b   │                  │
-                  │  │   (delay 2×i)      │ (delay 2×j)│                │
-                  │  └──────────┬──────────┴────┬─────┘                  │
-                  │             │               │                         │
-                  │  ┌──────────▼───────────────▼──────┐                  │
-                  │  │   systolic_array_nxn_ctrl       │                  │
-                  │  │   (N×N PE_ctrl)                 │                  │
-                  │  └──────────┬──────────────────────┘                  │
-                  │             │ pe_c (N² × ACCUM)                      │
-                  │  ┌──────────▼──────────────────────┐                  │
-                  │  │   readout_shifter               │                  │
-                  │  │   (parallel load, row shift)    │                  │
-                  │  └──────────┬──────────────────────┘                  │
-                  │             │ shift_row (N × ACCUM)                   │
-                  │  ┌──────────▼──────────┐  ┌───────────────────┐      │
-                  │  │   readout_unit      │  │  output_buffer    │      │
-                  │  │   (internal, unused │  │  (2×N×N deep,     │      │
-                  │  │    outputs)         │  │   row-level IO)   │      │
-                  │  └─────────────────────┘  └────┬──────────────┘      │
-                  │                                │                      │
-  done ◄──────────┤                                │                      │
-  out_raddr ──────┤                                │                      │
-  out_dout ◄──────┘                                │                      │
-                   └────────────────────────────────┘
+                    ┌──────────────────────────────────────────────────┐
+                    │                   system                         │
+                    │                                                  │
+  dma_* ────────────┤  ┌──────────────┐                               │
+                    │  │    ibram     │  (double-buffered, 2×64×32)    │
+                    │  └──────┬───────┘                               │
+                    │         │ pc_addr, inst_dout                     │
+                    │         │                                         │
+                    │  ┌──────▼───────┐                               │
+                    │  │ dispatch_unit│  (8-state FSM)                 │
+                    │  └──┬──┬──┬──┬──┘                               │
+                    │     │  │  │  │                                    │
+                    │     │  │  │  └─── dep_check_en / dep_release_en   │
+                    │     │  │  │         ┌───────────────────────┐     │
+                    │     │  │  └─────────┤ dependency_checker   │     │
+                    │     │  │            │ (64-entry lock table) │     │
+                    │     │  │            └───────────────────────┘     │
+                    │     │  │                                          │
+                    │     │  └──────── sys_start/sys_wgt_base/...       │
+                    │     │          (to execution unit)                │
+                    │     │                                             │
+                    │     └────────────── sys_done (from exec unit)     │
+                    │                                                   │
+  state_debug ──────┤  (FSM state, opcode, lock_status debug outputs)  │
+  lock_status ──────┤                                                   │
+                    └──────────────────────────────────────────────────┘
 ```
 
-## Data Flow
+## Instruction Pipeline (current `system.v`)
 
-### 0. Buffer Preload (External)
+### Parameters
 
-Before starting a computation, the testbench/memory interface preloads the activation and weight buffers element-by-element:
+| Parameter    | Default | Description                              |
+|--------------|---------|------------------------------------------|
+| `N`          | 4       | Matrix dimension (passed through to exec)|
+| `SLOT_DEPTH` | 64      | Instructions per IBRAM slot              |
+| `NUM_TILES`  | 64      | Number of tiles for dependency checker   |
 
-- **Activation buffer** (`act_buf`, COL_MAJOR=1): stores `A[r][c]` at linear address `r × N + c`. The feed reads column `act_base + feed_idx` — each column `N` gives one N-element column of A.
-- **Weight buffer** (`wgt_buf`, COL_MAJOR=0): stores `B[r][c]` at linear address `r × N + c`. The feed reads row `wgt_base + feed_idx` — each row gives one N-element row of B.
+### Ports
 
-Both buffers are **2×N×N deep** to support ping-pong double-buffering. The Ping block occupies addresses `0..N×N-1`, the Pong block `N×N..2×N×N-1`. Bases `0..N-1` select Ping, bases `N..2N-1` select Pong.
+| Port             | Width | Direction | Description                                |
+|------------------|-------|-----------|--------------------------------------------|
+| `clk`            | 1     | I         | Clock                                      |
+| `rst`            | 1     | I         | Synchronous reset                          |
+| `dma_en`         | 1     | I         | DMA write enable                          |
+| `dma_we`         | 1     | I         | DMA write strobe                          |
+| `dma_addr`       | A*    | I         | DMA write address                         |
+| `dma_din`        | 32    | I         | DMA write data (instruction word)         |
+| `sys_busy`       | 1     | I         | Execution unit busy (status only, unused) |
+| `sys_done`       | 1     | I         | Execution unit done (triggers RELEASE)    |
+| `sys_start`      | 1     | O         | Pulse: start execution (MATMUL only)       |
+| `sys_matrix_size`| 32    | O         | Matrix dimension (constant `N`)           |
+| `sys_act_base`   | 32    | O         | Activation tile number                    |
+| `sys_wgt_base`   | 32    | O         | Weight tile number                        |
+| `sys_out_base`   | 32    | O         | Output tile number                        |
+| `active_slot`    | 1     | O         | IBRAM active slot (0 or 1)               |
+| `ibram_ready`    | 1     | O         | IBRAM active slot is full                |
+| `busy`           | 1     | O         | Pipeline is actively processing           |
+| `state_debug`    | 4     | O         | FSM state for debug                       |
+| `opcode_debug`   | 4     | O         | Current opcode for debug                  |
+| `lock_status`    | 64    | O         | Tile lock table readout                   |
 
-### 1. Feed Generation
+\* A = `$clog2(2*SLOT_DEPTH)` (default: 8 bits for 128 total instruction addresses).
 
-The `execution_sequencer` drives `data_valid` and `data_idx` to indicate which column/row pair to feed next. The feed control logic computes:
+### Submodules
 
-- `act_feed_idx = data_idx + act_base` — selects a column from the activation buffer
-- `wgt_feed_idx = data_idx + wgt_base` — selects a row from the weight buffer
+| Instance       | Module               | Description                              |
+|----------------|----------------------|------------------------------------------|
+| `u_ibram`      | `ibram`              | Double-buffered instruction RAM          |
+| `u_dep`        | `dependency_checker` | 64-entry tile lock table                 |
+| `u_dispatch`   | `dispatch_unit`      | 8-state pipeline FSM                     |
 
-Feed `k` provides:
-- `raw_a_col = A[:, k]` (column k of the tile, N elements)
-- `raw_b_row = B[k, :]` (row k of the tile, N elements)
+The instruction decoder is **not a separate module** — field extraction happens inline in `dispatch_unit.v` during the DECODE_W state.
 
-### 2. Skew Buffering
+### Pipeline States
 
-Two identical `skew_buffer` instances delay each element so that all `(A[i][k], B[k][j])` pairs arrive at `PE(i,j)` on the correct clock cycle:
+| State       | Description                                        |
+|-------------|----------------------------------------------------|
+| `IDLE`      | Waiting for IBRAM ready                            |
+| `FETCH`     | Assert PC to IBRAM, increment PC                   |
+| `DECODE_W`  | Sample instruction word, register all fields        |
+| `CHECK`     | Assert dep_check_en for MATMUL/LOAD/STORE          |
+| `DISPATCH`  | Assert sys_start (MATMUL) or init loop/branch       |
+| `WAIT_EXEC` | Poll sys_done, stall until done                     |
+| `RELEASE`   | Assert dep_release_en, release tiles                |
+| `LOOP_JUMP` | Set PC to loop/jump target                         |
 
-- `skew_a`: row `i` is delayed by `i × 2` cycles
-- `skew_b`: column `j` is delayed by `j × 2` cycles
+See `docs/dispatch_unit.md` for complete FSM details.
 
-### 3. Systolic Array Computation
+### Instruction Flow (Cycle Counts)
 
-The `systolic_array_nxn_ctrl` instantitates an N×N grid of `PE_ctrl` tiles. Each PE accumulates the dot product:
+| Opcode     | FETCH | D_W | CHECK | DISPATCH | WAIT_EXEC | RELEASE | LJ  | Total |
+|------------|-------|-----|-------|----------|-----------|---------|-----|-------|
+| MATMUL     | 1     | 1   | 3†     | 1        | 7         | 1       | 0   | 14    |
+| LOAD/STORE | 1     | 1   | 3†     | 1        | 5         | 1       | 0   | 12    |
+| BARRIER/NOP| 1     | 1   | 1     | 1        | 0         | 0       | 0   | 4     |
+| LOOP       | 1     | 1   | 1     | 1        | 0         | 0       | 1   | 5     |
+| JUMP       | 1     | 1   | 1     | 1        | 0         | 0       | 1   | 5     |
+
+† CHECK takes 3 cycles: (1) assert dep_check_en, (2) dep checker processes, (3) read dep_grant. If conflict, CHECK stalls indefinitely.
+
+### Memory Map (DMA)
+
+Instructions are loaded via the DMA interface (`dma_en`, `dma_we`, `dma_addr`, `dma_din`). Address mapping:
+
+| Address range              | IBRAM region      |
+|----------------------------|-------------------|
+| `0 .. SLOT_DEPTH-1`        | Slot 0            |
+| `SLOT_DEPTH .. 2*SLOT_DEPTH-1` | Slot 1        |
+
+The DMA interface writes at posedge when both `dma_en` and `dma_we` are asserted.
+
+---
+
+## Systolic Datapath (existing submodules)
+
+The systolic array subsystem computes `C = A × B` for N×N tiles. It is driven by the execution unit handshake from the instruction pipeline.
+
+### Component Hierarchy
 
 ```
-PE(i,j) accumulates: Σ_k A[i][k] × B[k][j]
-```
-
-### 4. Drain
-
-After all M feeds, the sequencer enters DRAIN, keeping `acc_en=1` while the last data propagates through the pipeline.
-
-### 5. Readout Shift
-
-When the pipeline is fully drained, `readout_trig` pulses for 1 cycle, causing the `readout_shifter` to parallel-capture all N×N accumulator values from the array into N internal row registers. The sequencer then enters the SHIFT state, which lasts M cycles. During each SHIFT cycle, the shifter outputs one row (N elements).
-
-### 6. Output Buffer Write
-
-Each SHIFT cycle writes one row into the `output_buffer` at address `out_waddr` (starting from `out_base`, incremented each cycle). The output buffer is **2×N×N deep**:
-
-- Ping block: rows 0..N-1 (`out_base = 0`)
-- Pong block: rows N..2N-1 (`out_base = N`)
-
-After the last SHIFT cycle, the sequencer asserts `done`. The result is read asynchronously via `out_raddr` / `out_dout`.
-
-## Component Hierarchy
-
-```
-system
-├── execution_sequencer              (FSM controller)
+execution unit (generic handshake interface)
+├── execution_sequencer              (FSM: CLEAR→LOAD→DRAIN→RDOUT→SHIFT→DONE)
 ├── feed_buffer    #act_buf          (activation memory, COL_MAJOR, 2×N×N)
 ├── feed_buffer    #wgt_buf          (weight memory, row major, 2×N×N)
-├── skew_buffer    #skew_a           (A-column skew)
-├── skew_buffer    #skew_b           (B-row skew)
+├── skew_buffer    #skew_a           (A-column skew, delay 2×i)
+├── skew_buffer    #skew_b           (B-row skew, delay 2×j)
 ├── systolic_array_nxn_ctrl          (controlled array)
 │   └── PE_ctrl × N×N               (processing elements)
 ├── readout_shifter                  (parallel load, row-by-row shift)
@@ -138,116 +147,113 @@ system
 └── output_buffer                    (result memory, 2×N×N)
 ```
 
-## Pipeline Stages
+### Data Flow
 
-| Stage | Cycles | Description |
-|-------|--------|-------------|
-| CLEAR | 1 | Reset all accumulators to 0 |
-| LOAD | `2M` | Feed M column-row pairs (every 2 cycles) |
-| DRAIN | `4M` (auto) | Wait for pipeline to drain |
-| RDOUT | 1 | Load shifter with all PE accumulator values |
-| SHIFT | `M` | Stream rows from shifter → output buffer |
-| DONE | until `!start` | Hold done flag |
+The execution sequencer drives the computation:
+
+| Stage   | Cycles    | Description                                |
+|---------|-----------|--------------------------------------------|
+| CLEAR   | 1         | Reset all accumulators to 0                |
+| LOAD    | `2M`      | Feed M column-row pairs (every 2 cycles)   |
+| DRAIN   | `4M`      | Wait for pipeline to drain                 |
+| RDOUT   | 1         | Load shifter with all PE accumulator values|
+| SHIFT   | `M`       | Stream rows from shifter → output buffer   |
+| DONE    | until `!start` | Hold done flag                        |
 
 (M = runtime `matrix_size`, 1 ≤ M ≤ N)
 
-## Latency
+**Total latency**: `L_total = 1 + 2M + 4M + 1 + M + 1 = 7M + 3` cycles from `start` to `done`.
 
-Total cycles from `start` to `done`:
+### Feed Buffers (Ping-Pong)
 
-```
-L_total = 1 + 2M + 4M + 1 + M + 1 = 7M + 3
-```
+Each feed/output buffer is `2×N×N` deep:
 
-For M=4: 31 cycles. For M=8: 59 cycles.
+| Block     | Address range      | Base value |
+|-----------|--------------------|------------|
+| Ping (A/B)| `0 .. N·N-1`       | 0          |
+| Pong (A/B)| `N·N .. 2·N·N-1`  | N          |
 
-## Parameters
+### Processing Element
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `N` | 4 | Physical matrix dimension (array size) |
-| `DATA_WIDTH` | 16 | Element bit width |
-| `ACCUM_WIDTH` | 40 | Accumulator bit width |
+Each `PE_ctrl` in the N×N array computes: `C[i][j] += A[i][k] × B[k][j]` for k=0..M-1.
 
-## Runtime Configuration (inputs, latched at `start`)
+Intermediate values are **stationary** — held in registers until the next computation or reset.
 
-| Port | Width | Description |
-|------|-------|-------------|
-| `matrix_size` | 32 | Tile dimension M (1..N) |
-| `act_base` | 32 | Activation column offset for sub-tile / ping-pong |
-| `wgt_base` | 32 | Weight row offset for sub-tile / ping-pong |
-| `out_base` | 32 | Output row offset for sub-tile / ping-pong |
+### Readout
 
-## Buffer Interface
+After DRAIN completes:
+1. `readout_trig` pulses — all N×N accumulator values parallel-capture into the shifter
+2. SHIFT state outputs one row (N elements) per cycle
+3. Each row is written to the output buffer
 
-| Port | Direction | Width | Description |
-|------|-----------|-------|-------------|
-| `act_we` | input | 1 | Activation buffer write enable |
-| `act_waddr` | input | `$clog2(2·N·N)` | Element write address |
-| `act_din` | input | `DATA_WIDTH` | Element write data |
-| `wgt_we` | input | 1 | Weight buffer write enable |
-| `wgt_waddr` | input | `$clog2(2·N·N)` | Element write address |
-| `wgt_din` | input | `DATA_WIDTH` | Element write data |
-| `out_raddr` | input | `$clog2(2·N)` | Row read address (async) |
-| `out_dout` | output | `N × ACCUM_WIDTH` | Row read data (async) |
+### Verification (Systolic Datapath Only)
 
-## Interface Protocol
+The `tb_system.v` legacy tests verify all N from 2 to 4 with:
+- Full deterministic and random fills
+- Sub-tile M=2 with offsets
+- Ping-pong double-buffer preload overlap
 
-1. Preload activation/weight buffers via `act_we`/`wgt_we` (Ping or Pong block)
-2. Set `matrix_size`, `act_base`, `wgt_base`, `out_base`
-3. Assert `start` for at least one posedge
-4. Sequencer auto-runs through CLEAR → LOAD → DRAIN → RDOUT → SHIFT → DONE
-5. Wait for `done` posedge
-6. Read result rows via `out_raddr` / `out_dout` (async, no clock needed between reads)
-7. To restart with new data: preload the other buffer block, flip bases, pulse `start`
+---
 
-## Ping-Pong Double Buffering
+## Integration: Instruction Pipeline → Execution Unit
 
-Each feed/output buffer is 2×N×N deep to support overlap of computation and preload:
+The instruction pipeline and the systolic datapath are designed to connect through a standard handshake:
 
-1. **Preload Ping block** (addresses `0..N·N-1` for elements, bases `0..N-1` for rows/columns)
-2. **Start compute** with bases pointing to Ping block
-3. **While computing**, preload Pong block (addresses `N·N..2·N·N-1`, bases `N..2N-1`)
-4. **Wait for done**, read Ping result from output (`out_base=0`, `out_raddr=0..M-1`)
-5. **Flip**: set bases to Pong, start next compute
-6. **While computing**, preload Ping block with next tile's data
+### Interface Signals
+
+| Signal              | Width | Direction (pipeline) | Description          |
+|---------------------|-------|-----------------------|----------------------|
+| `sys_start`         | 1     | O                     | Pulse: start compute |
+| `sys_matrix_size`   | 32    | O                     | Tile dimension (N)   |
+| `sys_wgt_base`      | 32    | O                     | Weight tile number   |
+| `sys_act_base`      | 32    | O                     | Activation tile number|
+| `sys_out_base`      | 32    | O                     | Output tile number   |
+| `sys_busy`          | 1     | I                     | Exec unit busy       |
+| `sys_done`          | 1     | I                     | Exec unit complete   |
+
+### Protocol
+
+1. **MATMUL opcode**: Pipeline asserts `sys_start=1` for 1 cycle with tile numbers on `sys_*_base`.
+2. Execution unit captures tile numbers at posedge of `sys_start`, begins computation.
+3. Execution unit asserts `sys_busy=1` during computation (informational — not used by pipeline FSM).
+4. Execution unit asserts `sys_done=1` when computation is complete and results are available.
+5. Pipeline transitions WAIT_EXEC → RELEASE, freeing tile locks.
+
+### LOAD/STORE
+
+For LOAD/STORE, the pipeline does **not** assert `sys_start`. An external proxy module monitors the WAIT_EXEC state and drives `sys_done` after a fixed latency (e.g., via a counter or DMA completion signal). The pipeline only releases the single tile lock after `sys_done` is received.
+
+---
 
 ## Verification
 
-The testbench (`tb_system.v`) runs per N:
+### Instruction Pipeline Tests
 
-1. **Full deterministic** (values derived from indices, verified against reference)
-2. **Full random** (seed 42)
-3. **Full random** (seed 99)
-4. **Sub-tile M=2** (deterministic, tile fits within N×N)
-5. **Sub-tile M=2** (random)
-6. **Sub-tile M=2 with non-zero base offsets** (act_base=1, wgt_base=1, out_base=1)
-7. **Ping-pong double buffer**: preload Ping → compute → preload Pong while computing → verify Ping → flip bases → compute Pong → verify Pong
+| Testbench              | Checks | Description                               |
+|------------------------|--------|-------------------------------------------|
+| `tb_dependency`        | 51     | Lock/unlock, conflict, edge cases         |
+| `tb_dispatch`          | 79     | All 8 FSM states, opcode paths, loop/jump |
+| `tb_instruction_pipeline` | 17  | End-to-end pipeline with all opcodes      |
+| `tb_system`            | 106    | Full system (7 opcodes × 2+, groups A–F)  |
+| **Total**              | **253** | All passing                                |
 
-All N from 2 to 4 pass with the default configuration.
+### Test Scenarios (`tb_system`)
 
-## Memory Map (buffer addressing)
+| Group | Scenario                               | Opcodes                |
+|-------|----------------------------------------|------------------------|
+| A     | Two independent MATMULs on tile 1,2    | MATMUL, MATMUL         |
+| B     | LOAD → STORE → MATMUL chain on tile 10 | LOAD, STORE, MATMUL    |
+| C     | BARRIER + NOP pipeline passthrough     | BARRIER, NOP           |
+| D     | LOOP count=3 over MATMUL body          | LOOP, MATMUL           |
+| E     | JUMP to addr 12 (skip addrs 10–11)     | JUMP, MATMUL           |
+| F     | Post-jump chain                        | MATMUL, LOAD, STORE, BARRIER |
 
-Each buffer is 2×N×N elements deep:
+## Parameters Summary
 
-| Block | Address range | Base value |
-|-------|--------------|------------|
-| Ping (A/B) | `0 .. N·N-1` | 0 |
-| Pong (A/B) | `N·N .. 2·N·N-1` | N |
-
-Base values are interpreted per buffer:
-- **Activation feed** (`act_base`): selects column `act_base + data_idx` — Ping for bases 0..N-1, Pong for bases N..2N-1
-- **Weight feed** (`wgt_base`): selects row `wgt_base + data_idx`
-- **Output write** (`out_base`): starts output row address at `out_base`, increments per shift
-
-## Output Stationarity
-
-| Module | Output | Stationary? | Why |
-|--------|--------|-------------|-----|
-| `PE_ctrl` | `out_c` | Yes | Register holds value until next clock edge; frozen when `acc_en=0` |
-| `systolic_array_nxn_ctrl` | `out_c` | Yes | All PE `out_c` registers hold in parallel |
-| `readout_shifter` | `row_out` | Yes | Internal row registers hold until overwritten by next `load` |
-| `readout_unit` | `result` | Yes | Assembled from shifter rows, held until next readout |
-| `execution_sequencer` | `done` | Yes | Held until `start` deasserted |
-| `feed_buffer` | `dout` | Async | Combinational read from mem (changes with raddr) |
-| `output_buffer` | `dout` | Async | Combinational read from mem (changes with raddr) |
+| Parameter    | Scope                 | Default | Description                      |
+|--------------|-----------------------|---------|----------------------------------|
+| `N`          | Pipeline + Systolic   | 4       | Physical matrix dimension        |
+| `SLOT_DEPTH` | Pipeline only         | 64      | Instructions per IBRAM slot      |
+| `NUM_TILES`  | Pipeline only         | 64      | Dependency checker table depth   |
+| `DATA_WIDTH` | Systolic only         | 16      | Element bit width                |
+| `ACCUM_WIDTH`| Systolic only         | 40      | Accumulator bit width            |
