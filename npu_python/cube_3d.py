@@ -51,8 +51,8 @@ def perspective_projection(fov=90, aspect=1.0, near=0.1, far=10.0):
 
 
 class NPUCubeRenderer:
-    def __init__(self, n=4, width=60, height=30, use_verilog=False):
-        self.npu = NPUSimulator(n=n, use_verilog=use_verilog, q_factor=256)
+    def __init__(self, n=4, width=60, height=30):
+        self.npu = NPUSimulator(n=n)
         self.width = width
         self.height = height
         self.angle = 0

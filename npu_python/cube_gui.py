@@ -49,7 +49,7 @@ def rotation_matrix_y(angle):
 
 
 class NPUCubeGUI:
-    def __init__(self, width=1000, height=750, use_verilog=False):
+    def __init__(self, width=1000, height=750):
         pygame.init()
         self.width = width
         self.height = height
@@ -62,7 +62,7 @@ class NPUCubeGUI:
         self.hud_bg.set_alpha(200)
         self.hud_bg.fill((0, 0, 0))
 
-        self.npu = NPUSimulator(n=4, use_verilog=use_verilog, q_factor=256)
+        self.npu = NPUSimulator(n=4)
         self.show_debug = True
         self.font_small = pygame.font.Font(None, 20)
         self.font_large = pygame.font.Font(None, 28)
@@ -71,6 +71,8 @@ class NPUCubeGUI:
         self.angle_y = 0
         self.auto_rotate = True
         self.rot_speed = 0.02
+        self.mouse_down = False
+        self.last_mouse = (0, 0)
 
         self.npu.load_tile(TILE_VERTS_A, CUBE_VERTS[:, 0:4])
         self.npu.load_tile(TILE_VERTS_B, CUBE_VERTS[:, 4:8])
@@ -189,6 +191,7 @@ class NPUCubeGUI:
             ('CONTROLS', self.font_large, (100, 200, 255)),
             ('', None, None),
             ('Space:  toggle auto-rotate', self.font_small, (200, 200, 200)),
+            ('Drag:   orbit (mouse)', self.font_small, (200, 200, 200)),
             ('R:      reset rotation', self.font_small, (200, 200, 200)),
             ('D:      toggle debug', self.font_small, (200, 200, 200)),
             ('Esc:    quit', self.font_small, (200, 200, 200)),
@@ -215,6 +218,18 @@ class NPUCubeGUI:
                     self.angle_y = 0
                 if event.key == pygame.K_d:
                     self.show_debug = not self.show_debug
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                self.mouse_down = True
+                self.last_mouse = event.pos
+                self.auto_rotate = False
+            if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                self.mouse_down = False
+            if event.type == pygame.MOUSEMOTION and self.mouse_down:
+                dx = event.pos[0] - self.last_mouse[0]
+                dy = event.pos[1] - self.last_mouse[1]
+                self.angle_y += dx * 0.005
+                self.angle_x += dy * 0.005
+                self.last_mouse = event.pos
 
         keys = pygame.key.get_pressed()
         if not self.auto_rotate:
@@ -257,8 +272,8 @@ class NPUCubeGUI:
         pygame.quit()
 
 
-def main(use_verilog=False):
-    gui = NPUCubeGUI(width=1000, height=750, use_verilog=use_verilog)
+def main():
+    gui = NPUCubeGUI(width=1000, height=750)
     gui.run()
 
 

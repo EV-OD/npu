@@ -1,4 +1,5 @@
 import numpy as np
+from verilog_backend import verilog_matmul
 
 OP_MATMUL = 0x0
 OP_LOAD   = 0x1
@@ -53,114 +54,15 @@ def decode(word):
     return info
 
 
-import os
-import subprocess
-
-_VERILOG_AVAILABLE = None
-
-
-def _check_verilog():
-    global _VERILOG_AVAILABLE
-    if _VERILOG_AVAILABLE is None:
-        try:
-            subprocess.run(['iverilog', '--version'],
-                           capture_output=True, timeout=5)
-            subprocess.run(['vvp', '--version'],
-                           capture_output=True, timeout=5)
-            _VERILOG_AVAILABLE = True
-        except (FileNotFoundError, subprocess.SubprocessError):
-            _VERILOG_AVAILABLE = False
-    return _VERILOG_AVAILABLE
-
-
-class SystolicArray:
-    def __init__(self, n=4):
-        self.N = n
-        self.cycle = 0
-
-    def matmul(self, A, B, trace=False):
-        N = self.N
-        assert A.shape == (N, N) and B.shape == (N, N)
-
-        if trace:
-            print(f'\n  ┌─ Systolic Array MATMUL ──────────────────────────┐')
-            for i in range(N):
-                a_str = '  '.join(f'{A[i,k]:6.1f}' for k in range(N))
-                print(f'  │  A row {i}: [{a_str}]')
-            for j in range(N):
-                b_str = '  '.join(f'{B[k,j]:6.1f}' for k in range(N))
-                print(f'  │  B col {j}: [{b_str}]')
-            print(f'  │  Output-stationary dataflow: N={N}, total MACs={N**3}')
-            print(f'  ├─ Cycle trace ─────────────────────────────────────┤')
-
-        # PE accumulators
-        acc = np.zeros((N, N))
-        self.cycle = 0
-
-        # ── CLEAR ──
-        if trace:
-            print(f'  │  Cyc {self.cycle:2d}: CLEAR (acc_clr=1)')
-        self.cycle += 1
-
-        for k in range(N):
-            feed_start = 1 + 2 * k
-
-            if trace:
-                A_col = [A[i, k] for i in range(N)]
-                B_row = [B[k, j] for j in range(N)]
-                a_str = ', '.join(f'{v:.1f}' for v in A_col)
-                b_str = ', '.join(f'{v:.1f}' for v in B_row)
-                print(f'  │  Cyc {feed_start-1:2d}: LOAD k={k} transition')
-                print(f'  │  Cyc {feed_start:2d}: Feed k={k}  '
-                      f'A[:,{k}]=[{a_str}]  B[{k},:]=[{b_str}]')
-
-            for i in range(N):
-                for j in range(N):
-                    a_delay = 2 * i + j
-                    b_delay = 2 * j + i
-                    arrive = feed_start + max(a_delay, b_delay)
-                    accum_cycle = arrive + 2
-
-                    if accum_cycle <= 1 + 2 * N + 4 * N:
-                        prod = A[i, k] * B[k, j]
-                        acc[i, j] += prod
-
-                        if trace and max(a_delay, b_delay) < 8:
-                            print(f'  │         PE({i},{j}): '
-                                  f'A[{i}][{k}]×B[{k}][{j}] = {A[i,k]:.1f}×{B[k,j]:.1f} = {prod:.1f}  '
-                                  f'(skew A:{2*i} B:{2*j}, prop A:{j} B:{i}, arr={arrive})')
-
-        drain_start = 1 + 2 * N
-        if trace:
-            print(f'  │  Cyc {drain_start:2d}: DRAIN start (4N={4*N} cycles)')
-        self.cycle = drain_start + 4 * N
-
-        rdout_cycle = self.cycle
-        if trace:
-            print(f'  │  Cyc {rdout_cycle:2d}: RDOUT (parallel capture)')
-        self.cycle += 1
-        shift_cycle = self.cycle
-        if trace:
-            print(f'  │  Cyc {shift_cycle:2d}: SHIFT (N={N} cycles)')
-        self.cycle += N
-        if trace:
-            print(f'  │  Cyc {self.cycle:2d}: DONE')
-            print(f'  ├─ Result ──────────────────────────────────────────┤')
-            for i in range(N):
-                row_str = '  '.join(f'{acc[i,j]:10.1f}' for j in range(N))
-                print(f'  │  C row {i}: [{row_str}]')
-            print(f'  └────────────────────────────────────────────────────┘\n')
-
-        return acc
+Q_FACTOR = 256
 
 
 class NPUSimulator:
-    def __init__(self, n=4, num_tiles=64, use_verilog=False, q_factor=1.0):
+    def __init__(self, n=4, num_tiles=64):
         self.N = n
         self.num_tiles = num_tiles
         self.tiles = {}
         self.dram = {}
-        self.array = SystolicArray(n)
 
         self.ibram = [0] * 128
         self.pc = 0
@@ -169,13 +71,7 @@ class NPUSimulator:
         self.loop_body_target = 0
 
         self.stats = {'matmul': 0, 'cycles': 0, 'macs': 0}
-
-        self.use_verilog = use_verilog and _check_verilog()
-        if use_verilog and not self.use_verilog:
-            print('Warning: iverilog not found, falling back to Python simulation')
-        self.q_factor = q_factor
-        if self.use_verilog:
-            print(f'Using Verilog RTL backend for MATMUL (q_factor={q_factor})')
+        self.q_factor = Q_FACTOR
 
     def load_tile(self, tile_num, matrix):
         assert matrix.shape == (self.N, self.N), f'Tile must be {self.N}x{self.N}'
@@ -207,14 +103,10 @@ class NPUSimulator:
             for row in B:
                 print(f'  ║    [{"  ".join(f"{v:6.1f}" for v in row)}]')
 
-        if self.use_verilog:
-            from verilog_backend import verilog_matmul
-            q = self.q_factor
-            Aq = np.clip(np.round(A * q), -32768, 32767).astype(np.int32)
-            Bq = np.clip(np.round(B * q), -32768, 32767).astype(np.int32)
-            C_partial = verilog_matmul(Aq, Bq).astype(np.float64) / (q * q)
-        else:
-            C_partial = self.array.matmul(A, B, trace=trace)
+        q = self.q_factor
+        Aq = np.clip(np.round(A * q), -32768, 32767).astype(np.int32)
+        Bq = np.clip(np.round(B * q), -32768, 32767).astype(np.int32)
+        C_partial = verilog_matmul(Aq, Bq).astype(np.float64) / (q * q)
 
         self.tiles[out_tile] = C_out + C_partial
         self.stats['matmul'] += 1
@@ -224,8 +116,7 @@ class NPUSimulator:
         self.stats['cycles'] += expected_cycles
 
         if trace:
-            if self.use_verilog:
-                print(f'  ║  [Verilog RTL simulation]')
+            print(f'  ║  [Verilog RTL simulation]')
             print(f'  ║  Accumulated into tile {out_tile}:')
             result = self.tiles[out_tile]
             for row in result:
