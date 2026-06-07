@@ -21,3 +21,6 @@ docs/book
 .ip_user_files/
 .xil/
 
+
+npu_python/__pycache__/
+npu_python/venv/
