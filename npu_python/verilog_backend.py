@@ -36,53 +36,77 @@ module tb_cosim;
 
     always #5 clk = ~clk;
 
-    integer i, j;
+    integer i, j, fd, seq, expected_seq;
+    reg [8*40:1] hexname;
     reg signed [DATA_WIDTH-1:0] A [0:N-1][0:N-1];
     reg signed [DATA_WIDTH-1:0] B [0:N-1][0:N-1];
 
     initial begin
         clk = 0; rst = 1;
         start = 0; a_we = 0; b_we = 0;
-
-        $readmemh("tb_A.hex", A);
-        $readmemh("tb_B.hex", B);
-
         repeat (2) @(posedge clk);
         rst = 0;
         @(posedge clk);
 
-        // Preload A (stored column-major: addr = col + row*N)
-        for (i = 0; i < N; i = i + 1)
-            for (j = 0; j < N; j = j + 1) begin
-                @(negedge clk);
-                a_we <= 1; a_waddr <= i + j * N; a_din <= A[i][j];
+        expected_seq = 0;
+
+        while (1) begin
+            // Wait for go.signal with matching sequence number
+            fd = 0;
+            while (fd == 0) begin
+            fd = $fopen("go.signal", "r");
+            if (fd) begin
+                seq = -1;
+                if ($fscanf(fd, "%d", seq) != 1)
+                    seq = -1;
+                $fclose(fd);
+                if (seq != expected_seq) begin
+                    fd = 0;
+                    #1000;
+                end
+            end else begin
+                    #1000;
+                end
             end
 
-        // Preload B (stored row-major: addr = row*N + col)
-        for (i = 0; i < N; i = i + 1)
-            for (j = 0; j < N; j = j + 1) begin
-                @(negedge clk);
-                b_we <= 1; b_waddr <= i * N + j; b_din <= B[i][j];
-            end
+            $swrite(hexname, "tb_A_%0d.hex", expected_seq);
+            $readmemh(hexname, A);
+            $swrite(hexname, "tb_B_%0d.hex", expected_seq);
+            $readmemh(hexname, B);
 
-        @(negedge clk);
-        a_we <= 0; b_we <= 0;
+            for (i = 0; i < N; i = i + 1)
+                for (j = 0; j < N; j = j + 1) begin
+                    @(negedge clk);
+                    a_we <= 1; a_waddr <= i + j * N; a_din <= A[i][j];
+                end
 
-        @(posedge clk);
-        start <= 1;
-        @(posedge clk);
-        start <= 0;
+            for (i = 0; i < N; i = i + 1)
+                for (j = 0; j < N; j = j + 1) begin
+                    @(negedge clk);
+                    b_we <= 1; b_waddr <= i * N + j; b_din <= B[i][j];
+                end
 
-        wait(done);
-        @(posedge clk);
+            @(negedge clk);
+            a_we <= 0; b_we <= 0;
 
-        $display("RESULT_MATRIX");
-        for (i = 0; i < N; i = i + 1)
-            for (j = 0; j < N; j = j + 1)
-                $display("C[%0d][%0d] = %0d", i, j,
-                    $signed(result_data[((i * N + j) * ACCUM_WIDTH) +: ACCUM_WIDTH]));
-        $display("END_RESULT");
-        $finish;
+            @(posedge clk);
+            start <= 1;
+            @(posedge clk);
+            start <= 0;
+
+            @(posedge done);
+            @(posedge clk);
+
+            $display("RESULT_MATRIX %0d", expected_seq);
+            for (i = 0; i < N; i = i + 1)
+                for (j = 0; j < N; j = j + 1)
+                    $display("C[%0d][%0d] = %0d", i, j,
+                        $signed(result_data[((i * N + j) * ACCUM_WIDTH) +: ACCUM_WIDTH]));
+            $display("END_RESULT %0d", expected_seq);
+            $fflush();
+
+            expected_seq = expected_seq + 1;
+        end
     end
 
 endmodule
@@ -106,7 +130,18 @@ _HEX_DIR = Path('/tmp')
 
 class _VerilogSession:
     def __init__(self):
+        self._seq = 0
+        self._proc = None
+        self._buf = ''
         self._ensure_compiled()
+        self._start_vvp()
+
+    def _start_vvp(self):
+        self._proc = subprocess.Popen(
+            ['vvp', str(_VVP_PATH)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=str(_HEX_DIR), text=True, bufsize=1
+        )
 
     def _ensure_compiled(self):
         tb_file = _HEX_DIR / 'tb_cosim.v'
@@ -134,25 +169,39 @@ class _VerilogSession:
             if comp.returncode != 0:
                 raise RuntimeError(f'iverilog failed:\n{comp.stderr}')
 
+    def _read_until(self, marker):
+        while marker not in self._buf:
+            if self._proc.stdout.closed:
+                raise RuntimeError('vvp stdout closed')
+            line = self._proc.stdout.readline()
+            if not line:
+                raise RuntimeError('vvp stdout stream ended')
+            self._buf += line
+        idx = self._buf.find(marker)
+        result = self._buf[:idx + len(marker)]
+        self._buf = self._buf[idx + len(marker):]
+        return result
+
     def matmul(self, A, B):
         N = A.shape[0]
-        self._write_hex('tb_A.hex', A.flatten())
-        self._write_hex('tb_B.hex', B.flatten())
+        seq = self._seq
+        self._write_hex(f'tb_A_{seq}.hex', A.flatten())
+        self._write_hex(f'tb_B_{seq}.hex', B.flatten())
 
-        sim = subprocess.run(
-            ['vvp', str(_VVP_PATH)],
-            capture_output=True, text=True, timeout=30,
-            cwd=str(_HEX_DIR)
-        )
+        go_path = _HEX_DIR / 'go.signal'
+        go_path.write_text(f'{seq}\n')
+
+        end_marker = f'END_RESULT {seq}'
+        all_output = self._read_until(end_marker)
 
         C = np.zeros((N, N), dtype=np.float64)
         in_result = False
-        for line in sim.stdout.splitlines():
+        for line in all_output.splitlines():
             line = line.strip()
-            if line == 'RESULT_MATRIX':
+            if line.startswith('RESULT_MATRIX'):
                 in_result = True
                 continue
-            if line == 'END_RESULT':
+            if line.startswith('END_RESULT'):
                 break
             if in_result:
                 m = re.match(r'C\[(\d+)\]\[(\d+)\]\s*=\s*(-?\d+)', line)
@@ -160,6 +209,8 @@ class _VerilogSession:
                     i, j, val = int(m.group(1)), int(m.group(2)), int(m.group(3))
                     if 0 <= i < N and 0 <= j < N:
                         C[i, j] = float(val)
+
+        self._seq += 1
         return C
 
     def _write_hex(self, name, data):
@@ -171,6 +222,16 @@ class _VerilogSession:
             u = iv & 0xFFFF
             lines.append(f'{u:04x}')
         path.write_text('\n'.join(lines) + '\n')
+
+    def close(self):
+        if self._proc:
+            try:
+                go_path = _HEX_DIR / 'go.signal'
+                go_path.write_text(f'-1\n')
+                self._proc.wait(timeout=5)
+            except Exception:
+                self._proc.kill()
+            self._proc = None
 
 
 _session = None

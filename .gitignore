@@ -20,6 +20,11 @@ docs/book
 .hw/
 .ip_user_files/
 .xil/
+*.tex
+*.pdf
+*.aux
+*.out
+*.npz
 
 
 npu_python/__pycache__/
