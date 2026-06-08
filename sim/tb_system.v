@@ -200,7 +200,7 @@ module tb_system;
     endtask
 
     initial begin
-        $dumpfile("tb_system.vcd");
+        $dumpfile("build/tb_system.vcd");
         $dumpvars(0, tb_system);
 
         clk = 0; rst = 1;
